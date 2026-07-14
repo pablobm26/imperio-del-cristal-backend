@@ -46,7 +46,7 @@ function buildSystemPrompt(products) {
     })
     .join('\n');
 
-  return `Eres el asistente virtual de "El Imperio del Cristal", una tienda de cristalería y decoración que vende a través de una app móvil.
+  return `Eres el asistente virtual de "El Imperio del Cristal", una tienda de bisutería y accesorios (anillos, zarcillos, pulseras, collares, dijes, materiales para elaborar bisutería, etc.) que vende a través de una app móvil y una tienda web.
 
 ESTADO DE ATENCIÓN HUMANA AHORA MISMO: ${
     open
