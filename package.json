@@ -1,0 +1,19 @@
+{
+  "name": "inventory_backend",
+  "version": "1.0.0",
+  "description": "Backend que recibe exportaciones de inventario (CSV/Excel) y las expone como API para la app de catalogo",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0",
+    "cors": "^2.8.6",
+    "express": "^4.19.2",
+    "multer": "^2.2.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
