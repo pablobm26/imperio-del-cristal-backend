@@ -12,14 +12,18 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 // Allow the Flutter web build (served from a different origin/port) to call the API.
 app.use('/api', cors());
 
-const DATA_DIR = path.join(__dirname, 'data');
+// Si DATA_DIR apunta a un disco persistente de Render (ver README), los datos sobreviven a los
+// redeploys. Sin esa variable, cae de vuelta a la carpeta local del repo (efímera en Render free).
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
 const DETAILS_FILE = path.join(DATA_DIR, 'product_details.json');
+const REVIEWS_FILE = path.join(DATA_DIR, 'reviews.json');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PRODUCTS_FILE)) fs.writeFileSync(PRODUCTS_FILE, '[]');
 if (!fs.existsSync(DETAILS_FILE)) fs.writeFileSync(DETAILS_FILE, '{}');
+if (!fs.existsSync(REVIEWS_FILE)) fs.writeFileSync(REVIEWS_FILE, '{}');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -114,6 +118,20 @@ function saveDetails(details) {
   fs.writeFileSync(DETAILS_FILE, JSON.stringify(details, null, 2));
 }
 
+function loadReviews() {
+  return JSON.parse(fs.readFileSync(REVIEWS_FILE, 'utf8'));
+}
+
+function saveReviews(reviews) {
+  fs.writeFileSync(REVIEWS_FILE, JSON.stringify(reviews, null, 2));
+}
+
+function ratingSummary(productReviews) {
+  if (!productReviews || productReviews.length === 0) return { rating: null, reviewCount: 0 };
+  const sum = productReviews.reduce((acc, r) => acc + r.rating, 0);
+  return { rating: Math.round((sum / productReviews.length) * 10) / 10, reviewCount: productReviews.length };
+}
+
 // Manual edits from /admin/products win over whatever the Excel provided for the same field.
 function mergeProductWithDetails(product, details) {
   const override = details[product.id];
@@ -130,7 +148,11 @@ function mergeProductWithDetails(product, details) {
 function getMergedProducts() {
   const products = loadProducts();
   const details = loadDetails();
-  return products.map((p) => mergeProductWithDetails(p, details));
+  const reviews = loadReviews();
+  return products.map((p) => {
+    const merged = mergeProductWithDetails(p, details);
+    return { ...merged, ...ratingSummary(reviews[p.id]) };
+  });
 }
 
 // --- Routes ---
@@ -363,21 +385,59 @@ app.get('/api/categories', (req, res) => {
   res.json(categories);
 });
 
-// --- Simple in-memory rate limiter for the chat endpoint (per IP) ---
-const CHAT_RATE_LIMIT = 20; // messages
-const CHAT_RATE_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-const chatRateLimitByIp = new Map();
-
-function isRateLimited(ip) {
-  const now = Date.now();
-  const entry = chatRateLimitByIp.get(ip);
-  if (!entry || now - entry.windowStart > CHAT_RATE_WINDOW_MS) {
-    chatRateLimitByIp.set(ip, { count: 1, windowStart: now });
-    return false;
-  }
-  entry.count += 1;
-  return entry.count > CHAT_RATE_LIMIT;
+// --- Simple in-memory rate limiter, per IP, reused for chat and review submissions ---
+function makeRateLimiter(limit, windowMs) {
+  const byIp = new Map();
+  return function isRateLimited(ip) {
+    const now = Date.now();
+    const entry = byIp.get(ip);
+    if (!entry || now - entry.windowStart > windowMs) {
+      byIp.set(ip, { count: 1, windowStart: now });
+      return false;
+    }
+    entry.count += 1;
+    return entry.count > limit;
+  };
 }
+
+const isChatRateLimited = makeRateLimiter(20, 60 * 60 * 1000); // 20 messages/hour
+const isReviewRateLimited = makeRateLimiter(5, 60 * 60 * 1000); // 5 reviews/hour
+
+const MAX_REVIEW_COMMENT_LENGTH = 120;
+
+app.get('/api/products/:id/reviews', (req, res) => {
+  const reviews = loadReviews();
+  res.json(reviews[req.params.id] || []);
+});
+
+app.post('/api/products/:id/reviews', (req, res) => {
+  const products = loadProducts();
+  const product = products.find((p) => p.id === req.params.id);
+  if (!product) {
+    return res.status(404).json({ error: 'Producto no encontrado.' });
+  }
+
+  if (isReviewRateLimited(req.ip)) {
+    return res.status(429).json({ error: 'Demasiadas reseñas enviadas. Intenta de nuevo más tarde.' });
+  }
+
+  const rating = Math.trunc(Number(req.body?.rating));
+  const comment = typeof req.body?.comment === 'string' ? req.body.comment.trim() : '';
+
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: 'La calificación debe ser un número entero de 1 a 5.' });
+  }
+  if (comment.length > MAX_REVIEW_COMMENT_LENGTH) {
+    return res.status(400).json({ error: `El comentario no puede superar los ${MAX_REVIEW_COMMENT_LENGTH} caracteres.` });
+  }
+
+  const reviews = loadReviews();
+  if (!reviews[product.id]) reviews[product.id] = [];
+  reviews[product.id].push({ rating, comment, createdAt: new Date().toISOString() });
+  saveReviews(reviews);
+
+  res.status(201).json({ ...ratingSummary(reviews[product.id]), reviews: reviews[product.id] });
+});
 
 app.post('/api/chat', async (req, res) => {
   const { message, history } = req.body || {};
@@ -386,7 +446,7 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'Falta el campo "message".' });
   }
 
-  if (isRateLimited(req.ip)) {
+  if (isChatRateLimited(req.ip)) {
     return res.status(429).json({ error: 'Demasiados mensajes. Intenta de nuevo más tarde.' });
   }
 
