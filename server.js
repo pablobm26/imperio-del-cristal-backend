@@ -42,7 +42,7 @@ const FIELD_SYNONYMS = {
 };
 
 // Fields editable manually from /admin/products (in addition to whatever the Excel provides)
-const DETAIL_FIELDS = ['width', 'height', 'length', 'material', 'weight', 'color', 'image2', 'image3', 'image4', 'video'];
+const DETAIL_FIELDS = ['width', 'height', 'length', 'material', 'weight', 'color', 'image', 'image2', 'image3', 'image4', 'video', 'description'];
 
 function normalize(header) {
   return String(header)
@@ -273,7 +273,7 @@ app.get('/admin/products/:id/edit', (req, res) => {
   <style>
     body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; color: #222; }
     label { display: block; margin-top: 12px; font-weight: 600; }
-    input { display: block; margin-top: 4px; padding: 8px; width: 100%; box-sizing: border-box; }
+    input, textarea { display: block; margin-top: 4px; padding: 8px; width: 100%; box-sizing: border-box; font-family: inherit; }
     button { margin-top: 16px; padding: 10px 20px; background: #4f46e5; color: white; border: none; border-radius: 6px; cursor: pointer; }
     .row { display: flex; gap: 8px; }
     .row > div { flex: 1; }
@@ -284,6 +284,9 @@ app.get('/admin/products/:id/edit', (req, res) => {
   <form method="post" action="/admin/products/${encodeURIComponent(product.id)}">
     <label>Contraseña de administración</label>
     <input type="password" name="password" required>
+
+    <label>Descripción breve</label>
+    <textarea name="description" rows="3" placeholder="Descripción del producto">${escapeHtml(product.description ?? '')}</textarea>
 
     <label>Material</label>
     <input type="text" name="material" value="${escapeHtml(product.material ?? '')}" placeholder="Ej: Cristal soplado">
@@ -301,7 +304,10 @@ app.get('/admin/products/:id/edit', (req, res) => {
     <label>Peso (gramos)</label>
     <input type="number" step="1" name="weight" value="${product.weight ?? ''}" placeholder="Ej: 250">
 
-    <label>Fotos adicionales (URL) — la foto principal viene del Excel, columna "Imagen"</label>
+    <label>Foto principal (URL)</label>
+    <input type="url" name="image" value="${escapeHtml(product.image ?? '')}" placeholder="URL foto principal">
+
+    <label>Fotos adicionales (URL)</label>
     <input type="url" name="image2" value="${escapeHtml(product.image2 ?? '')}" placeholder="URL foto 2">
     <input type="url" name="image3" value="${escapeHtml(product.image3 ?? '')}" placeholder="URL foto 3">
     <input type="url" name="image4" value="${escapeHtml(product.image4 ?? '')}" placeholder="URL foto 4">
@@ -329,12 +335,14 @@ app.post('/admin/products/:id', (req, res) => {
 
   const details = loadDetails();
   details[product.id] = {
+    description: req.body.description ? String(req.body.description).trim() : null,
     material: req.body.material ? String(req.body.material).trim() : null,
     color: req.body.color ? String(req.body.color).trim() : null,
     width: parseOptionalNumber(req.body.width),
     height: parseOptionalNumber(req.body.height),
     length: parseOptionalNumber(req.body.length),
     weight: parseOptionalNumber(req.body.weight),
+    image: req.body.image ? String(req.body.image).trim() : null,
     image2: req.body.image2 ? String(req.body.image2).trim() : null,
     image3: req.body.image3 ? String(req.body.image3).trim() : null,
     image4: req.body.image4 ? String(req.body.image4).trim() : null,
