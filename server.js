@@ -42,7 +42,7 @@ const FIELD_SYNONYMS = {
 };
 
 // Fields editable manually from /admin/products (in addition to whatever the Excel provides)
-const DETAIL_FIELDS = ['width', 'height', 'length', 'material', 'weight', 'color'];
+const DETAIL_FIELDS = ['width', 'height', 'length', 'material', 'weight', 'color', 'image2', 'image3', 'image4', 'video'];
 
 function normalize(header) {
   return String(header)
@@ -94,6 +94,10 @@ function rowsToProducts(rows, columnMap) {
       material: columnMap.material ? String(row[columnMap.material] ?? '').trim() || null : null,
       weight: columnMap.weight ? parseOptionalNumber(row[columnMap.weight]) : null,
       color: columnMap.color ? String(row[columnMap.color] ?? '').trim() || null : null,
+      image2: null,
+      image3: null,
+      image4: null,
+      video: null,
     };
   }).filter(Boolean);
 }
@@ -297,6 +301,14 @@ app.get('/admin/products/:id/edit', (req, res) => {
     <label>Peso (gramos)</label>
     <input type="number" step="1" name="weight" value="${product.weight ?? ''}" placeholder="Ej: 250">
 
+    <label>Fotos adicionales (URL) — la foto principal viene del Excel, columna "Imagen"</label>
+    <input type="url" name="image2" value="${escapeHtml(product.image2 ?? '')}" placeholder="URL foto 2">
+    <input type="url" name="image3" value="${escapeHtml(product.image3 ?? '')}" placeholder="URL foto 3">
+    <input type="url" name="image4" value="${escapeHtml(product.image4 ?? '')}" placeholder="URL foto 4">
+
+    <label>Video (URL, ej. mp4 directo o link de YouTube)</label>
+    <input type="url" name="video" value="${escapeHtml(product.video ?? '')}" placeholder="URL del video">
+
     <button type="submit">Guardar</button>
   </form>
   <p><a href="/admin/products">&larr; Volver</a></p>
@@ -323,6 +335,10 @@ app.post('/admin/products/:id', (req, res) => {
     height: parseOptionalNumber(req.body.height),
     length: parseOptionalNumber(req.body.length),
     weight: parseOptionalNumber(req.body.weight),
+    image2: req.body.image2 ? String(req.body.image2).trim() : null,
+    image3: req.body.image3 ? String(req.body.image3).trim() : null,
+    image4: req.body.image4 ? String(req.body.image4).trim() : null,
+    video: req.body.video ? String(req.body.video).trim() : null,
   };
   saveDetails(details);
 
