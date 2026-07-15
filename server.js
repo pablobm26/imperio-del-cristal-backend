@@ -433,10 +433,37 @@ app.post('/api/products/:id/reviews', (req, res) => {
 
   const reviews = loadReviews();
   if (!reviews[product.id]) reviews[product.id] = [];
-  reviews[product.id].push({ rating, comment, createdAt: new Date().toISOString() });
+  reviews[product.id].push({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    rating,
+    comment,
+    createdAt: new Date().toISOString(),
+  });
   saveReviews(reviews);
 
   res.status(201).json({ ...ratingSummary(reviews[product.id]), reviews: reviews[product.id] });
+});
+
+// Moderación: borrar una reseña puntual (spam, prueba, contenido inapropiado).
+app.delete('/api/products/:id/reviews/:reviewId', (req, res) => {
+  if (req.body?.password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Contraseña incorrecta.' });
+  }
+
+  const reviews = loadReviews();
+  const productReviews = reviews[req.params.id];
+  if (!productReviews) {
+    return res.status(404).json({ error: 'Producto sin reseñas.' });
+  }
+
+  const nextReviews = productReviews.filter((r) => r.id !== req.params.reviewId);
+  if (nextReviews.length === productReviews.length) {
+    return res.status(404).json({ error: 'Reseña no encontrada.' });
+  }
+
+  reviews[req.params.id] = nextReviews;
+  saveReviews(reviews);
+  res.json({ ...ratingSummary(nextReviews), reviews: nextReviews });
 });
 
 app.post('/api/chat', async (req, res) => {
