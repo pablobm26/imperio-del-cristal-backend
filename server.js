@@ -173,6 +173,20 @@ function formatUsd(amount) {
   return `$${Number(amount).toFixed(2)}`;
 }
 
+// Miles con punto, decimales con coma — igual que tienda_web/lib/format.ts, para que el PDF
+// coincida con cómo se ve el precio en Bs durante el checkout.
+function formatBs(amount) {
+  const fixed = Number(amount).toFixed(2);
+  const [intPart, decimals] = fixed.split('.');
+  let grouped = '';
+  for (let i = 0; i < intPart.length; i++) {
+    const posFromEnd = intPart.length - i;
+    grouped += intPart[i];
+    if (posFromEnd > 1 && posFromEnd % 3 === 1) grouped += '.';
+  }
+  return `Bs ${grouped},${decimals}`;
+}
+
 // Genera el PDF de resumen de un pedido (para descarga del cliente y, a futuro, envío por
 // WhatsApp/correo). Usa pdfkit porque no requiere un navegador headless, ideal para un
 // documento simple con texto y una tabla.
@@ -216,6 +230,9 @@ function generateOrderPdfBuffer(order) {
     doc.fontSize(10);
     doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
     if (order.reference) doc.text(`Referencia: ${order.reference}`);
+    if (order.paymentMethod === 'pagoMovil' && order.bcvRate) {
+      doc.text(`Monto a pagar: ${formatBs(order.total * order.bcvRate)} (tasa BCV: ${formatBs(order.bcvRate)} por $1)`);
+    }
     doc.moveDown();
 
     doc.fontSize(12).fillColor('#000').text('Productos', { underline: true });
@@ -252,6 +269,9 @@ function generateOrderPdfBuffer(order) {
 
     doc.moveDown(0.5);
     doc.fontSize(12).text(`Total: ${formatUsd(order.total)}`, { align: 'right' });
+    if (order.bcvRate) {
+      doc.fontSize(9).fillColor('#666').text(`(${formatBs(order.total * order.bcvRate)})`, { align: 'right' });
+    }
 
     doc.end();
   });
@@ -560,6 +580,7 @@ app.post('/api/orders', async (req, res) => {
   const courier = body.courier ? String(body.courier) : '';
   const items = Array.isArray(body.items) ? body.items : [];
   const total = Number(body.total);
+  const bcvRate = Number.isFinite(Number(body.bcvRate)) && Number(body.bcvRate) > 0 ? Number(body.bcvRate) : null;
 
   if (!estado || !ciudad || !parroquia || !address || !cedula || !telefono || !correo) {
     return res.status(400).json({ error: 'Faltan campos requeridos.' });
@@ -598,6 +619,7 @@ app.post('/api/orders', async (req, res) => {
       reference,
       items: normalizedItems,
       total,
+      bcvRate,
     });
     fs.writeFileSync(path.join(ORDERS_PDF_DIR, `${orderId}.pdf`), pdfBuffer);
     pdfUrl = `/api/orders/${orderId}/pdf`;
