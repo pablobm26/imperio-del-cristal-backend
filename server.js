@@ -8,6 +8,7 @@ const cors = require('cors');
 const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
+const { getInventario, mapPladeItemToProduct, isPladeConfigured } = require('./plade-marketplade-client');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -332,6 +333,39 @@ function getMergedProducts() {
   });
 }
 
+// --- Sincronización con PLADE SOFTWARE (getInventario) ---
+// Solo se activa si PLADE_USER/PLADE_PASSWORD/PLADE_TOKEN están configurados como variables de
+// entorno; sin ellas, el catálogo sigue viniendo del CSV subido manualmente en /admin (sin cambios
+// de comportamiento para quien no tenga PLADE conectado). Escribe directo a PRODUCTS_FILE, así que
+// el resto del backend (getMergedProducts, /api/products, /api/categories) no necesita saber de
+// dónde vino el catálogo.
+const PLADE_SYNC_INTERVAL_MS = 30 * 60 * 1000; // cada 30 min alcanza para un catálogo que no cambia segundo a segundo
+let lastPladeSync = null; // { at: string, count: number } | { at: string, error: string }
+
+async function syncProductsFromPlade() {
+  const items = await getInventario();
+  const products = items.map(mapPladeItemToProduct).filter((p) => p.id && p.title);
+  fs.writeFileSync(PRODUCTS_FILE, JSON.stringify(products, null, 2));
+  lastPladeSync = { at: new Date().toISOString(), count: products.length };
+  console.log(`Sincronizado con PLADE: ${products.length} productos (${lastPladeSync.at})`);
+  return products.length;
+}
+
+if (isPladeConfigured()) {
+  syncProductsFromPlade().catch((err) => {
+    lastPladeSync = { at: new Date().toISOString(), error: err.message };
+    console.error('Error en sincronización inicial con PLADE:', err.message);
+  });
+  setInterval(() => {
+    syncProductsFromPlade().catch((err) => {
+      lastPladeSync = { at: new Date().toISOString(), error: err.message };
+      console.error('Error en sincronización periódica con PLADE:', err.message);
+    });
+  }, PLADE_SYNC_INTERVAL_MS);
+} else {
+  console.log('PLADE_USER/PLADE_PASSWORD/PLADE_TOKEN no configurados: usando el catálogo cargado manualmente.');
+}
+
 // --- Routes ---
 
 app.get('/', (req, res) => {
@@ -368,6 +402,24 @@ app.get('/admin', (req, res) => {
     <button type="submit">Subir y reemplazar inventario</button>
   </form>
   <div class="status">Productos actualmente cargados: <b>${products.length}</b></div>
+
+  <div class="status">
+    <b>Sincronización con PLADE SOFTWARE:</b>
+    ${isPladeConfigured() ? 'activa (cada 30 min)' : 'no configurada (faltan variables de entorno PLADE_USER/PLADE_PASSWORD/PLADE_TOKEN)'}<br>
+    ${lastPladeSync
+      ? (lastPladeSync.error
+          ? `Último intento (${lastPladeSync.at}): <span style="color:#b91c1c">error — ${escapeHtml(lastPladeSync.error)}</span>`
+          : `Última sincronización exitosa: ${lastPladeSync.at} — ${lastPladeSync.count} productos`)
+      : 'Todavía no se ha sincronizado en esta sesión del servidor.'}
+  </div>
+  ${isPladeConfigured() ? `
+  <form action="/admin/sync-plade" method="post">
+    <label>Contraseña de administración</label>
+    <input type="password" name="password" required>
+    <button type="submit">Sincronizar con PLADE ahora</button>
+  </form>
+  ` : ''}
+
   ${products.length ? `
   <table>
     <tr><th>ID</th><th>Nombre</th><th>Precio</th><th>Stock</th><th>Categoría</th></tr>
@@ -413,6 +465,21 @@ app.post('/admin/upload', upload.single('file'), (req, res) => {
     res.send(`Inventario actualizado: ${products.length} productos cargados. <a href="/admin">Volver</a>`);
   } catch (err) {
     res.status(500).send(`Error procesando el archivo: ${err.message}. <a href="/admin">Volver</a>`);
+  }
+});
+
+app.post('/admin/sync-plade', async (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) {
+    return res.status(401).send('Contraseña incorrecta. <a href="/admin">Volver</a>');
+  }
+  if (!isPladeConfigured()) {
+    return res.status(400).send('PLADE no está configurado (faltan PLADE_USER/PLADE_PASSWORD/PLADE_TOKEN). <a href="/admin">Volver</a>');
+  }
+  try {
+    const count = await syncProductsFromPlade();
+    res.send(`Sincronizado con PLADE: ${count} productos actualizados. <a href="/admin">Volver</a>`);
+  } catch (err) {
+    res.status(500).send(`Error sincronizando con PLADE: ${err.message}. <a href="/admin">Volver</a>`);
   }
 });
 
