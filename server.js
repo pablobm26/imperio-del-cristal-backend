@@ -3,7 +3,9 @@ const multer = require('multer');
 const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const cors = require('cors');
+const PDFDocument = require('pdfkit');
 const { getChatReply } = require('./chat');
 
 const app = express();
@@ -20,6 +22,7 @@ const DETAILS_FILE = path.join(DATA_DIR, 'product_details.json');
 const REVIEWS_FILE = path.join(DATA_DIR, 'reviews.json');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders_location.json');
 const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
+const ORDERS_PDF_DIR = path.join(DATA_DIR, 'orders_pdfs');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -28,6 +31,7 @@ if (!fs.existsSync(DETAILS_FILE)) fs.writeFileSync(DETAILS_FILE, '{}');
 if (!fs.existsSync(REVIEWS_FILE)) fs.writeFileSync(REVIEWS_FILE, '{}');
 if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
 if (!fs.existsSync(CUSTOMERS_FILE)) fs.writeFileSync(CUSTOMERS_FILE, '{}');
+if (!fs.existsSync(ORDERS_PDF_DIR)) fs.mkdirSync(ORDERS_PDF_DIR, { recursive: true });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -144,6 +148,113 @@ function loadCustomers() {
 
 function saveCustomers(customers) {
   fs.writeFileSync(CUSTOMERS_FILE, JSON.stringify(customers, null, 2));
+}
+
+const DELIVERY_METHOD_LABELS = {
+  pickup: 'Retiro en tienda (Pickup)',
+  homeDelivery: 'Delivery a domicilio (Gran Valencia)',
+  nationalShipping: 'Envío nacional',
+};
+const PICKUP_STORE_LABELS = {
+  avBolivarNorte: 'Sede Av. Bolívar Norte, Valencia — C.C. SALMA',
+  avUniversidad: 'Sede Av. Universidad — C.C. La Granja',
+};
+const PAYMENT_METHOD_LABELS = {
+  card: 'Tarjeta de crédito/débito',
+  cash: 'Efectivo contra entrega',
+  zinli: 'Zinli',
+  zelle: 'Zelle',
+  binance: 'Binance (USDT)',
+  pagoMovil: 'Pago Móvil (Venezuela)',
+};
+const COURIER_LABELS = { mrw: 'MRW', zoom: 'Zoom', tealca: 'Tealca' };
+
+function formatUsd(amount) {
+  return `$${Number(amount).toFixed(2)}`;
+}
+
+// Genera el PDF de resumen de un pedido (para descarga del cliente y, a futuro, envío por
+// WhatsApp/correo). Usa pdfkit porque no requiere un navegador headless, ideal para un
+// documento simple con texto y una tabla.
+function generateOrderPdfBuffer(order) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 50 });
+    const chunks = [];
+    doc.on('data', (chunk) => chunks.push(chunk));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+
+    doc.fontSize(18).text('El Imperio del Cristal', { align: 'left' });
+    doc.fontSize(11).fillColor('#666').text('Resumen de pedido', { align: 'left' });
+    doc.moveDown(0.5);
+    doc.fontSize(9).fillColor('#999').text(`Pedido ${order.orderId}`);
+    doc.text(`Fecha: ${new Date(order.createdAt).toLocaleString('es-VE')}`);
+    doc.moveDown();
+
+    doc.fillColor('#000').fontSize(12).text('Datos del cliente', { underline: true });
+    doc.fontSize(10);
+    doc.text(`Nombre: ${order.nombre}`);
+    doc.text(`Identificación: ${order.idType}-${order.cedula}`);
+    doc.text(`Teléfono: ${order.telefono}`);
+    doc.text(`Correo: ${order.correo}`);
+    doc.moveDown();
+
+    doc.fontSize(12).text('Entrega', { underline: true });
+    doc.fontSize(10);
+    doc.text(`Estado: ${order.estado}   Ciudad: ${order.ciudad}   Parroquia: ${order.parroquia}`);
+    doc.text(`Dirección: ${order.address}`);
+    doc.text(`Método: ${DELIVERY_METHOD_LABELS[order.deliveryMethod] || order.deliveryMethod}`);
+    if (order.deliveryMethod === 'pickup' && order.pickupStore) {
+      doc.text(`Sede: ${PICKUP_STORE_LABELS[order.pickupStore] || order.pickupStore}`);
+    }
+    if (order.deliveryMethod === 'nationalShipping' && order.courier) {
+      doc.text(`Empresa de envío: ${COURIER_LABELS[order.courier] || order.courier}`);
+    }
+    doc.moveDown();
+
+    doc.fontSize(12).text('Pago', { underline: true });
+    doc.fontSize(10);
+    doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
+    if (order.reference) doc.text(`Referencia: ${order.reference}`);
+    doc.moveDown();
+
+    doc.fontSize(12).fillColor('#000').text('Productos', { underline: true });
+    doc.moveDown(0.3);
+
+    const startX = doc.x;
+    const cols = [
+      { label: 'Producto', x: startX, width: 250 },
+      { label: 'Cant.', x: startX + 250, width: 40 },
+      { label: 'Precio', x: startX + 290, width: 90 },
+      { label: 'Subtotal', x: startX + 380, width: 90 },
+    ];
+
+    function drawRow(values, y, opts) {
+      cols.forEach((col, i) => {
+        doc.text(values[i], col.x, y, { width: col.width, lineBreak: false, ...opts });
+      });
+    }
+
+    doc.fontSize(9).fillColor('#666');
+    drawRow(cols.map((c) => c.label), doc.y);
+    doc.moveDown(0.5);
+
+    doc.fontSize(10).fillColor('#000');
+    for (const item of order.items) {
+      const y = doc.y;
+      const title = item.title.length > 42 ? `${item.title.slice(0, 41)}…` : item.title;
+      drawRow(
+        [title, String(item.quantity), formatUsd(item.price), formatUsd(item.price * item.quantity)],
+        y
+      );
+      doc.moveDown(0.6);
+    }
+
+    doc.moveDown(0.5);
+    doc.fontSize(12).text(`Total: ${formatUsd(order.total)}`, { align: 'right' });
+
+    doc.end();
+  });
 }
 
 function ratingSummary(productReviews) {
@@ -427,7 +538,7 @@ const isOrderRateLimited = makeRateLimiter(10, 60 * 60 * 1000); // 10 pedidos/ho
 // Registro interno (no es un backend de pedidos real, ver checkout simulado): guarda ESTADO/CIUDAD/
 // PARROQUIA para estadística de ventas por ubicación, y CEDULA/TELEFONO/CORREO en una lista de
 // clientes deduplicada para poder contactarlos a futuro (publicidad, avisos).
-app.post('/api/orders', (req, res) => {
+app.post('/api/orders', async (req, res) => {
   if (isOrderRateLimited(req.ip)) {
     return res.status(429).json({ error: 'Demasiados pedidos registrados. Intenta de nuevo más tarde.' });
   }
@@ -436,25 +547,73 @@ app.post('/api/orders', (req, res) => {
   const estado = String(body.estado ?? '').trim();
   const ciudad = String(body.ciudad ?? '').trim();
   const parroquia = String(body.parroquia ?? '').trim();
+  const address = String(body.address ?? '').trim();
   const idType = String(body.idType ?? '').trim();
   const cedula = String(body.cedula ?? '').trim();
   const nombre = String(body.nombre ?? '').trim();
   const telefono = String(body.telefono ?? '').trim();
   const correo = String(body.correo ?? '').trim();
+  const deliveryMethod = String(body.deliveryMethod ?? '');
+  const paymentMethod = String(body.paymentMethod ?? '');
+  const reference = body.reference ? String(body.reference).trim() : '';
+  const pickupStore = body.pickupStore ? String(body.pickupStore) : '';
+  const courier = body.courier ? String(body.courier) : '';
+  const items = Array.isArray(body.items) ? body.items : [];
+  const total = Number(body.total);
 
-  if (!estado || !ciudad || !parroquia || !cedula || !telefono || !correo) {
+  if (!estado || !ciudad || !parroquia || !address || !cedula || !telefono || !correo) {
     return res.status(400).json({ error: 'Faltan campos requeridos.' });
   }
+  if (items.length === 0 || !Number.isFinite(total)) {
+    return res.status(400).json({ error: 'Faltan los productos o el total del pedido.' });
+  }
+
+  const normalizedItems = items.map((item) => ({
+    title: String(item?.title ?? '').trim() || 'Producto',
+    quantity: Math.max(1, Math.trunc(Number(item?.quantity) || 1)),
+    price: Number(item?.price) || 0,
+  }));
 
   const createdAt = new Date().toISOString();
+  const orderId = crypto.randomBytes(16).toString('hex');
+
+  let pdfUrl = null;
+  try {
+    const pdfBuffer = await generateOrderPdfBuffer({
+      orderId,
+      createdAt,
+      nombre,
+      idType,
+      cedula,
+      telefono,
+      correo,
+      estado,
+      ciudad,
+      parroquia,
+      address,
+      deliveryMethod,
+      pickupStore,
+      courier,
+      paymentMethod,
+      reference,
+      items: normalizedItems,
+      total,
+    });
+    fs.writeFileSync(path.join(ORDERS_PDF_DIR, `${orderId}.pdf`), pdfBuffer);
+    pdfUrl = `/api/orders/${orderId}/pdf`;
+  } catch (err) {
+    console.error('No se pudo generar el PDF del pedido:', err.message);
+  }
 
   const orders = loadOrdersLocation();
   orders.push({
+    orderId,
     estado,
     ciudad,
     parroquia,
-    deliveryMethod: String(body.deliveryMethod ?? ''),
-    paymentMethod: String(body.paymentMethod ?? ''),
+    deliveryMethod,
+    paymentMethod,
+    pdfUrl,
     createdAt,
   });
   saveOrdersLocation(orders);
@@ -474,7 +633,23 @@ app.post('/api/orders', (req, res) => {
   };
   saveCustomers(customers);
 
-  res.status(201).json({ ok: true });
+  res.status(201).json({ ok: true, orderId, pdfUrl });
+});
+
+// El nombre de archivo es el propio orderId (32 hex chars al azar, no adivinable ni enumerable),
+// así que sirve como token de acceso: no requiere ADMIN_PASSWORD, igual que un link de
+// confirmación de pedido en cualquier tienda online.
+app.get('/api/orders/:orderId/pdf', (req, res) => {
+  if (!/^[a-f0-9]{32}$/.test(req.params.orderId)) {
+    return res.status(400).json({ error: 'ID de pedido inválido.' });
+  }
+  const filePath = path.join(ORDERS_PDF_DIR, `${req.params.orderId}.pdf`);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Pedido no encontrado.' });
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="pedido-${req.params.orderId.slice(0, 8)}.pdf"`);
+  fs.createReadStream(filePath).pipe(res);
 });
 
 // Reportes crudos para el dueño (sin UI todavía) — protegidos con ADMIN_PASSWORD por venir con datos
