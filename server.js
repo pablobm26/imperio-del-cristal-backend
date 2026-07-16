@@ -18,12 +18,16 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
 const DETAILS_FILE = path.join(DATA_DIR, 'product_details.json');
 const REVIEWS_FILE = path.join(DATA_DIR, 'reviews.json');
+const ORDERS_FILE = path.join(DATA_DIR, 'orders_location.json');
+const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PRODUCTS_FILE)) fs.writeFileSync(PRODUCTS_FILE, '[]');
 if (!fs.existsSync(DETAILS_FILE)) fs.writeFileSync(DETAILS_FILE, '{}');
 if (!fs.existsSync(REVIEWS_FILE)) fs.writeFileSync(REVIEWS_FILE, '{}');
+if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
+if (!fs.existsSync(CUSTOMERS_FILE)) fs.writeFileSync(CUSTOMERS_FILE, '{}');
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -124,6 +128,22 @@ function loadReviews() {
 
 function saveReviews(reviews) {
   fs.writeFileSync(REVIEWS_FILE, JSON.stringify(reviews, null, 2));
+}
+
+function loadOrdersLocation() {
+  return JSON.parse(fs.readFileSync(ORDERS_FILE, 'utf8'));
+}
+
+function saveOrdersLocation(orders) {
+  fs.writeFileSync(ORDERS_FILE, JSON.stringify(orders, null, 2));
+}
+
+function loadCustomers() {
+  return JSON.parse(fs.readFileSync(CUSTOMERS_FILE, 'utf8'));
+}
+
+function saveCustomers(customers) {
+  fs.writeFileSync(CUSTOMERS_FILE, JSON.stringify(customers, null, 2));
 }
 
 function ratingSummary(productReviews) {
@@ -402,6 +422,89 @@ function makeRateLimiter(limit, windowMs) {
 
 const isChatRateLimited = makeRateLimiter(20, 60 * 60 * 1000); // 20 messages/hour
 const isReviewRateLimited = makeRateLimiter(5, 60 * 60 * 1000); // 5 reviews/hour
+const isOrderRateLimited = makeRateLimiter(10, 60 * 60 * 1000); // 10 pedidos/hora/IP
+
+// Registro interno (no es un backend de pedidos real, ver checkout simulado): guarda ESTADO/CIUDAD/
+// PARROQUIA para estadística de ventas por ubicación, y CEDULA/TELEFONO/CORREO en una lista de
+// clientes deduplicada para poder contactarlos a futuro (publicidad, avisos).
+app.post('/api/orders', (req, res) => {
+  if (isOrderRateLimited(req.ip)) {
+    return res.status(429).json({ error: 'Demasiados pedidos registrados. Intenta de nuevo más tarde.' });
+  }
+
+  const body = req.body || {};
+  const estado = String(body.estado ?? '').trim();
+  const ciudad = String(body.ciudad ?? '').trim();
+  const parroquia = String(body.parroquia ?? '').trim();
+  const idType = String(body.idType ?? '').trim();
+  const cedula = String(body.cedula ?? '').trim();
+  const nombre = String(body.nombre ?? '').trim();
+  const telefono = String(body.telefono ?? '').trim();
+  const correo = String(body.correo ?? '').trim();
+
+  if (!estado || !ciudad || !parroquia || !cedula || !telefono || !correo) {
+    return res.status(400).json({ error: 'Faltan campos requeridos.' });
+  }
+
+  const createdAt = new Date().toISOString();
+
+  const orders = loadOrdersLocation();
+  orders.push({
+    estado,
+    ciudad,
+    parroquia,
+    deliveryMethod: String(body.deliveryMethod ?? ''),
+    paymentMethod: String(body.paymentMethod ?? ''),
+    createdAt,
+  });
+  saveOrdersLocation(orders);
+
+  const customers = loadCustomers();
+  const key = `${idType}-${cedula}`;
+  const existing = customers[key];
+  customers[key] = {
+    idType,
+    cedula,
+    nombre,
+    telefono,
+    correo,
+    firstSeen: existing?.firstSeen ?? createdAt,
+    lastSeen: createdAt,
+    orderCount: (existing?.orderCount ?? 0) + 1,
+  };
+  saveCustomers(customers);
+
+  res.status(201).json({ ok: true });
+});
+
+// Reportes crudos para el dueño (sin UI todavía) — protegidos con ADMIN_PASSWORD por venir con datos
+// de clientes. Se usan por POST (no query string) para no dejar la contraseña en logs del servidor.
+app.post('/admin/orders-stats', (req, res) => {
+  if (req.body?.password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Contraseña incorrecta.' });
+  }
+
+  const orders = loadOrdersLocation();
+  const porEstado = {};
+  const porDia = {};
+  for (const o of orders) {
+    porEstado[o.estado] = (porEstado[o.estado] || 0) + 1;
+    const day = o.createdAt.slice(0, 10);
+    porDia[day] = porDia[day] || {};
+    porDia[day][o.estado] = (porDia[day][o.estado] || 0) + 1;
+  }
+
+  res.json({ total: orders.length, porEstado, porDia, orders });
+});
+
+app.post('/admin/customers', (req, res) => {
+  if (req.body?.password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Contraseña incorrecta.' });
+  }
+
+  const customers = loadCustomers();
+  res.json({ total: Object.keys(customers).length, customers: Object.values(customers) });
+});
 
 const MAX_REVIEW_COMMENT_LENGTH = 120;
 
