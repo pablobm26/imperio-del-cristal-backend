@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const cors = require('cors');
 const PDFDocument = require('pdfkit');
+const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 
 const app = express();
@@ -190,14 +191,16 @@ function formatBs(amount) {
 // Genera el PDF de resumen de un pedido (para descarga del cliente y, a futuro, envío por
 // WhatsApp/correo). Usa pdfkit porque no requiere un navegador headless, ideal para un
 // documento simple con texto y una tabla.
-function generateOrderPdfBuffer(order) {
-  return new Promise((resolve, reject) => {
-    const doc = new PDFDocument({ size: 'A4', margin: 50 });
-    const chunks = [];
-    doc.on('data', (chunk) => chunks.push(chunk));
+async function generateOrderPdfBuffer(order) {
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  const chunks = [];
+  doc.on('data', (chunk) => chunks.push(chunk));
+  const donePromise = new Promise((resolve, reject) => {
     doc.on('end', () => resolve(Buffer.concat(chunks)));
     doc.on('error', reject);
+  });
 
+  {
     doc.fontSize(18).text('El Imperio del Cristal', { align: 'left' });
     doc.fontSize(11).fillColor('#666').text('Resumen de pedido', { align: 'left' });
     doc.moveDown(0.5);
@@ -240,10 +243,11 @@ function generateOrderPdfBuffer(order) {
 
     const startX = doc.x;
     const cols = [
-      { label: 'Producto', x: startX, width: 250 },
-      { label: 'Cant.', x: startX + 250, width: 40 },
-      { label: 'Precio', x: startX + 290, width: 90 },
-      { label: 'Subtotal', x: startX + 380, width: 90 },
+      { label: 'Código', x: startX, width: 65 },
+      { label: 'Producto', x: startX + 65, width: 190 },
+      { label: 'Cant.', x: startX + 255, width: 35 },
+      { label: 'Precio', x: startX + 290, width: 85 },
+      { label: 'Subtotal', x: startX + 375, width: 90 },
     ];
 
     function drawRow(values, y, opts) {
@@ -259,9 +263,10 @@ function generateOrderPdfBuffer(order) {
     doc.fontSize(10).fillColor('#000');
     for (const item of order.items) {
       const y = doc.y;
-      const title = item.title.length > 42 ? `${item.title.slice(0, 41)}…` : item.title;
+      const title = item.title.length > 30 ? `${item.title.slice(0, 29)}…` : item.title;
+      const code = item.id.length > 10 ? `${item.id.slice(0, 9)}…` : item.id;
       drawRow(
-        [title, String(item.quantity), formatUsd(item.price), formatUsd(item.price * item.quantity)],
+        [code, title, String(item.quantity), formatUsd(item.price), formatUsd(item.price * item.quantity)],
         y
       );
       doc.moveDown(0.6);
@@ -272,9 +277,30 @@ function generateOrderPdfBuffer(order) {
     if (order.bcvRate) {
       doc.fontSize(9).fillColor('#666').text(`(${formatBs(order.total * order.bcvRate)})`, { align: 'right' });
     }
+  }
 
-    doc.end();
-  });
+  // Código de barras del número de pedido: permite escanear y validar en tienda que esta venta
+  // no se procese/entregue dos veces. No es un ID de pago externo, solo el orderId propio.
+  try {
+    const barcodeBuffer = await bwipjs.toBuffer({
+      bcid: 'code128',
+      text: order.orderId,
+      scale: 2,
+      height: 10,
+      includetext: false,
+    });
+    doc.moveDown(1.5);
+    doc.fontSize(9).fillColor('#666').text('Código de verificación del pedido (evita ventas duplicadas)', { align: 'center' });
+    doc.moveDown(0.3);
+    doc.image(barcodeBuffer, { fit: [260, 50], align: 'center' });
+    doc.moveDown(0.3);
+    doc.fontSize(9).fillColor('#000').text(order.orderId, { align: 'center' });
+  } catch (err) {
+    console.error('No se pudo generar el código de barras del pedido:', err.message);
+  }
+
+  doc.end();
+  return donePromise;
 }
 
 function ratingSummary(productReviews) {
@@ -590,6 +616,7 @@ app.post('/api/orders', async (req, res) => {
   }
 
   const normalizedItems = items.map((item) => ({
+    id: String(item?.id ?? '').trim() || '—',
     title: String(item?.title ?? '').trim() || 'Producto',
     quantity: Math.max(1, Math.trunc(Number(item?.quantity) || 1)),
     price: Number(item?.price) || 0,
