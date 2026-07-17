@@ -4,6 +4,7 @@ const XLSX = require('xlsx');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const https = require('https');
 const cors = require('cors');
 const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
@@ -365,6 +366,64 @@ if (isPladeConfigured()) {
 } else {
   console.log('PLADE_USER/PLADE_PASSWORD/PLADE_TOKEN no configurados: usando el catálogo cargado manualmente.');
 }
+
+// --- Tasa BCV (bolívares por dólar) ---
+// bcv.org.ve sirve una cadena de certificados TLS incompleta/rota (problema conocido y documentado
+// del propio sitio del Banco Central, no nuestro) — se desactiva la verificación SOLO para este host
+// fijo y hardcodeado (nunca para una URL dinámica): el dato es una tasa de cambio pública, no
+// información sensible ni un pago real, y el usuario siempre ve el monto antes de transferir.
+// Antes esto se raspaba en vivo en cada visita desde una ruta de Next.js — bcv.org.ve es lento y
+// eso hacía esperar segundos a cada sesión nueva. Aquí se cachea en memoria y se refresca cada 30
+// min (la tasa se publica una vez al día), así que responder es prácticamente instantáneo siempre.
+const BCV_URL = 'https://www.bcv.org.ve/';
+const BCV_SYNC_INTERVAL_MS = 30 * 60 * 1000;
+let bcvRateCache = null; // { rate: number, at: string } | { error: string, at: string }
+
+function fetchBcvHtml() {
+  return new Promise((resolve, reject) => {
+    const req = https.get(BCV_URL, { rejectUnauthorized: false }, (res) => {
+      if (!res.statusCode || res.statusCode >= 400) {
+        reject(new Error(`No se pudo obtener la tasa BCV (${res.statusCode})`));
+        res.resume();
+        return;
+      }
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve(data));
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => req.destroy(new Error('Tiempo de espera agotado consultando el BCV')));
+  });
+}
+
+async function syncBcvRate() {
+  const html = await fetchBcvHtml();
+  const dolarSectionMatch = html.match(/id="dolar"[\s\S]*?<\/div>\s*<\/div>/);
+  const section = dolarSectionMatch ? dolarSectionMatch[0] : html;
+  const rateMatch = section.match(/<strong[^>]*class="[^"]*strong-tb[^"]*"[^>]*>([^<]+)<\/strong>/);
+  const rateText = rateMatch?.[1]?.trim();
+  if (!rateText) throw new Error('No se encontró la tasa del dólar en la página del BCV');
+
+  const normalized = rateText.replace(/\./g, '').replace(',', '.');
+  const rate = parseFloat(normalized);
+  if (!Number.isFinite(rate)) throw new Error(`Formato de tasa BCV inesperado: ${rateText}`);
+
+  bcvRateCache = { rate, at: new Date().toISOString() };
+  console.log(`Tasa BCV actualizada: ${rate} (${bcvRateCache.at})`);
+  return rate;
+}
+
+syncBcvRate().catch((err) => {
+  bcvRateCache = { error: err.message, at: new Date().toISOString() };
+  console.error('Error en consulta inicial al BCV:', err.message);
+});
+setInterval(() => {
+  syncBcvRate().catch((err) => {
+    bcvRateCache = { error: err.message, at: new Date().toISOString() };
+    console.error('Error en consulta periódica al BCV:', err.message);
+  });
+}, BCV_SYNC_INTERVAL_MS);
 
 // --- Routes ---
 
@@ -887,6 +946,16 @@ app.post('/api/chat', async (req, res) => {
     console.error('Chat error:', err.message);
     res.status(500).json({ error: 'No se pudo generar una respuesta en este momento.' });
   }
+});
+
+app.get('/api/bcv', (req, res) => {
+  if (!bcvRateCache) {
+    return res.status(503).json({ error: 'Todavía no se ha consultado la tasa BCV en esta sesión del servidor.' });
+  }
+  if (bcvRateCache.error) {
+    return res.status(502).json({ error: bcvRateCache.error });
+  }
+  res.json({ rate: bcvRateCache.rate });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
