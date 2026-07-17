@@ -623,6 +623,14 @@ app.get('/api/products', (req, res) => {
   res.json(getMergedProducts());
 });
 
+// Un solo producto por ID — evita que la página de cada producto tenga que descargar el
+// catálogo completo (varios MB) solo para mostrar uno.
+app.get('/api/products/:id', (req, res) => {
+  const product = getMergedProducts().find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
+  res.json(product);
+});
+
 app.get('/api/categories', (req, res) => {
   const products = loadProducts();
   const categories = [...new Set(products.map((p) => p.category).filter(Boolean))];
