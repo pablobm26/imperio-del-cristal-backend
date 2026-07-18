@@ -190,117 +190,136 @@ function formatBs(amount) {
   return `Bs ${grouped},${decimals}`;
 }
 
-// Genera el PDF de resumen de un pedido (para descarga del cliente y, a futuro, envío por
-// WhatsApp/correo). Usa pdfkit porque no requiere un navegador headless, ideal para un
-// documento simple con texto y una tabla.
-async function generateOrderPdfBuffer(order) {
-  const doc = new PDFDocument({ size: 'A4', margin: 50 });
-  const chunks = [];
-  doc.on('data', (chunk) => chunks.push(chunk));
-  const donePromise = new Promise((resolve, reject) => {
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-  });
+// 1mm en puntos PDF (72 puntos por pulgada, 25.4mm por pulgada).
+function mm(value) {
+  return (value * 72) / 25.4;
+}
 
-  {
-    doc.fontSize(18).text('El Imperio del Cristal', { align: 'left' });
-    doc.fontSize(11).fillColor('#666').text('Resumen de pedido', { align: 'left' });
-    doc.moveDown(0.5);
-    doc.fontSize(9).fillColor('#999').text(`Pedido ${order.orderId}`);
-    doc.text(`Fecha: ${new Date(order.createdAt).toLocaleString('es-VE')}`);
-    doc.moveDown();
+const RECEIPT_WIDTH = mm(80); // ancho estándar de rollo térmico
+const RECEIPT_MARGIN = mm(4); // 80mm - 4mm*2 = 72mm de área imprimible, el estándar de la industria
+const RECEIPT_CONTENT_WIDTH = RECEIPT_WIDTH - RECEIPT_MARGIN * 2;
+const RECEIPT_MAX_HEIGHT = mm(1000); // alto holgado solo para medir, se recorta al alto real después
 
-    doc.fillColor('#000').fontSize(12).text('Datos del cliente', { underline: true });
-    doc.fontSize(10);
-    doc.text(`Nombre: ${order.nombre}`);
-    doc.text(`Identificación: ${order.idType}-${order.cedula}`);
-    doc.text(`Teléfono: ${order.telefono}`);
-    doc.text(`Correo: ${order.correo}`);
-    doc.moveDown();
+function drawReceiptDivider(doc) {
+  doc.moveDown(0.2);
+  const y = doc.y;
+  doc.moveTo(doc.x, y).lineTo(doc.x + RECEIPT_CONTENT_WIDTH, y).lineWidth(0.5).strokeColor('#999').stroke();
+  doc.moveDown(0.4);
+}
 
-    doc.fontSize(12).text('Entrega', { underline: true });
-    doc.fontSize(10);
-    doc.text(`Estado: ${order.estado}   Ciudad: ${order.ciudad}   Parroquia: ${order.parroquia}`);
-    doc.text(`Dirección: ${order.address}`);
-    doc.text(`Método: ${DELIVERY_METHOD_LABELS[order.deliveryMethod] || order.deliveryMethod}`);
-    if (order.deliveryMethod === 'pickup' && order.pickupStore) {
-      doc.text(`Sede: ${PICKUP_STORE_LABELS[order.pickupStore] || order.pickupStore}`);
-    }
-    if (order.deliveryMethod === 'nationalShipping' && order.courier) {
-      doc.text(`Empresa de envío: ${COURIER_LABELS[order.courier] || order.courier}`);
-    }
-    doc.moveDown();
+// Dibuja todo el contenido del recibo sobre un documento ya creado. Se llama dos veces (ver
+// generateOrderPdfBuffer): una para medir cuánta altura ocupa el contenido real, y otra para
+// generar el PDF final con esa altura exacta — así no se imprime papel en blanco de más.
+function drawReceiptBody(doc, order, barcodeBuffer) {
+  doc.font('Helvetica-Bold').fontSize(13).fillColor('#000').text('El Imperio del Cristal', { align: 'center' });
+  doc.font('Helvetica').fontSize(8).fillColor('#555').text('Bisutería y accesorios', { align: 'center' });
+  doc.moveDown(0.3);
+  doc.fontSize(7).fillColor('#999');
+  doc.text(`Pedido: ${order.orderId}`, { align: 'center' });
+  doc.text(`Fecha: ${new Date(order.createdAt).toLocaleString('es-VE')}`, { align: 'center' });
+  drawReceiptDivider(doc);
 
-    doc.fontSize(12).text('Pago', { underline: true });
-    doc.fontSize(10);
-    doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
-    if (order.reference) doc.text(`Referencia: ${order.reference}`);
-    if (order.paymentMethod === 'pagoMovil' && order.bcvRate) {
-      doc.text(`Monto a pagar: ${formatBs(order.total * order.bcvRate)} (tasa BCV: ${formatBs(order.bcvRate)} por $1)`);
-    }
-    doc.moveDown();
+  doc.font('Helvetica-Bold').fontSize(9).fillColor('#000').text('Datos del cliente');
+  doc.font('Helvetica').fontSize(8);
+  doc.text(`Nombre: ${order.nombre}`);
+  doc.text(`Identificación: ${order.idType}-${order.cedula}`);
+  doc.text(`Teléfono: ${order.telefono}`);
+  doc.text(`Correo: ${order.correo}`);
+  drawReceiptDivider(doc);
 
-    doc.fontSize(12).fillColor('#000').text('Productos', { underline: true });
+  doc.font('Helvetica-Bold').fontSize(9).text('Entrega');
+  doc.font('Helvetica').fontSize(8);
+  doc.text(`Estado: ${order.estado}`);
+  doc.text(`Ciudad: ${order.ciudad}`);
+  doc.text(`Parroquia: ${order.parroquia}`);
+  doc.text(`Dirección: ${order.address}`);
+  doc.text(`Método: ${DELIVERY_METHOD_LABELS[order.deliveryMethod] || order.deliveryMethod}`);
+  if (order.deliveryMethod === 'pickup' && order.pickupStore) {
+    doc.text(`Sede: ${PICKUP_STORE_LABELS[order.pickupStore] || order.pickupStore}`);
+  }
+  if (order.deliveryMethod === 'nationalShipping' && order.courier) {
+    doc.text(`Empresa de envío: ${COURIER_LABELS[order.courier] || order.courier}`);
+  }
+  drawReceiptDivider(doc);
+
+  doc.font('Helvetica-Bold').fontSize(9).text('Pago');
+  doc.font('Helvetica').fontSize(8);
+  doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
+  if (order.reference) doc.text(`Referencia: ${order.reference}`);
+  if (order.paymentMethod === 'pagoMovil' && order.bcvRate) {
+    doc.text(`Monto a pagar: ${formatBs(order.total * order.bcvRate)}`);
+    doc.text(`(tasa BCV: ${formatBs(order.bcvRate)} por $1)`);
+  }
+  drawReceiptDivider(doc);
+
+  doc.font('Helvetica-Bold').fontSize(9).text('Productos');
+  doc.moveDown(0.2);
+  for (const item of order.items) {
+    doc.font('Helvetica').fontSize(7).fillColor('#666').text(item.id);
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(item.title);
+    doc.font('Helvetica').fontSize(8);
+    doc.text(`${item.quantity} x ${formatUsd(item.price)} = ${formatUsd(item.price * item.quantity)}`);
     doc.moveDown(0.3);
+  }
+  drawReceiptDivider(doc);
 
-    const startX = doc.x;
-    const cols = [
-      { label: 'Código', x: startX, width: 65 },
-      { label: 'Producto', x: startX + 65, width: 190 },
-      { label: 'Cant.', x: startX + 255, width: 35 },
-      { label: 'Precio', x: startX + 290, width: 85 },
-      { label: 'Subtotal', x: startX + 375, width: 90 },
-    ];
-
-    function drawRow(values, y, opts) {
-      cols.forEach((col, i) => {
-        doc.text(values[i], col.x, y, { width: col.width, lineBreak: false, ...opts });
-      });
-    }
-
-    doc.fontSize(9).fillColor('#666');
-    drawRow(cols.map((c) => c.label), doc.y);
-    doc.moveDown(0.5);
-
-    doc.fontSize(10).fillColor('#000');
-    for (const item of order.items) {
-      const y = doc.y;
-      const title = item.title.length > 30 ? `${item.title.slice(0, 29)}…` : item.title;
-      const code = item.id.length > 10 ? `${item.id.slice(0, 9)}…` : item.id;
-      drawRow(
-        [code, title, String(item.quantity), formatUsd(item.price), formatUsd(item.price * item.quantity)],
-        y
-      );
-      doc.moveDown(0.6);
-    }
-
-    doc.moveDown(0.5);
-    doc.fontSize(12).text(`Total: ${formatUsd(order.total)}`, { align: 'right' });
-    if (order.bcvRate) {
-      doc.fontSize(9).fillColor('#666').text(`(${formatBs(order.total * order.bcvRate)})`, { align: 'right' });
-    }
+  doc.font('Helvetica-Bold').fontSize(11).text(`Total: ${formatUsd(order.total)}`, { align: 'right' });
+  if (order.bcvRate) {
+    doc.font('Helvetica').fontSize(8).fillColor('#666').text(`(${formatBs(order.total * order.bcvRate)})`, { align: 'right' });
   }
 
   // Código de barras del número de pedido: permite escanear y validar en tienda que esta venta
   // no se procese/entregue dos veces. No es un ID de pago externo, solo el orderId propio.
+  if (barcodeBuffer) {
+    doc.moveDown(0.8);
+    doc.fontSize(7).fillColor('#666').text('Código de verificación del pedido', { align: 'center' });
+    doc.moveDown(0.2);
+    doc.image(barcodeBuffer, { fit: [mm(60), mm(14)], align: 'center' });
+    doc.moveDown(0.2);
+    doc.font('Helvetica').fontSize(8).fillColor('#000').text(order.orderId, { align: 'center' });
+  }
+}
+
+// Genera el PDF de resumen de un pedido (para descarga del cliente, envío por WhatsApp, e
+// impresión en impresora térmica de 80mm). Usa pdfkit porque no requiere un navegador headless.
+// Como pdfkit necesita el tamaño de página al crearla, se dibuja el contenido dos veces: una vez
+// en un documento de altura holgada solo para medir cuánto ocupa de verdad (doc.y al terminar),
+// y otra en el documento final con esa altura exacta — así no queda papel en blanco de sobra al
+// imprimir en el rollo continuo.
+async function generateOrderPdfBuffer(order) {
+  let barcodeBuffer = null;
   try {
-    const barcodeBuffer = await bwipjs.toBuffer({
+    barcodeBuffer = await bwipjs.toBuffer({
       bcid: 'code128',
       text: order.orderId,
       scale: 2,
       height: 10,
       includetext: false,
     });
-    doc.moveDown(1.5);
-    doc.fontSize(9).fillColor('#666').text('Código de verificación del pedido (evita ventas duplicadas)', { align: 'center' });
-    doc.moveDown(0.3);
-    doc.image(barcodeBuffer, { fit: [260, 50], align: 'center' });
-    doc.moveDown(0.3);
-    doc.fontSize(9).fillColor('#000').text(order.orderId, { align: 'center' });
   } catch (err) {
     console.error('No se pudo generar el código de barras del pedido:', err.message);
   }
 
+  const measureDoc = new PDFDocument({
+    size: [RECEIPT_WIDTH, RECEIPT_MAX_HEIGHT],
+    margins: { top: RECEIPT_MARGIN, bottom: RECEIPT_MARGIN, left: RECEIPT_MARGIN, right: RECEIPT_MARGIN },
+  });
+  measureDoc.on('data', () => {});
+  drawReceiptBody(measureDoc, order, barcodeBuffer);
+  const contentHeight = Math.ceil(measureDoc.y) + RECEIPT_MARGIN;
+  measureDoc.end();
+
+  const doc = new PDFDocument({
+    size: [RECEIPT_WIDTH, contentHeight],
+    margins: { top: RECEIPT_MARGIN, bottom: RECEIPT_MARGIN, left: RECEIPT_MARGIN, right: RECEIPT_MARGIN },
+  });
+  const chunks = [];
+  doc.on('data', (chunk) => chunks.push(chunk));
+  const donePromise = new Promise((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+  drawReceiptBody(doc, order, barcodeBuffer);
   doc.end();
   return donePromise;
 }
