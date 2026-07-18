@@ -9,7 +9,7 @@ const cors = require('cors');
 const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
-const { getInventario, mapPladeItemToProduct, isPladeConfigured } = require('./plade-marketplade-client');
+const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade } = require('./plade-marketplade-client');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -350,6 +350,37 @@ async function syncProductsFromPlade() {
   lastPladeSync = { at: new Date().toISOString(), count: products.length };
   console.log(`Sincronizado con PLADE: ${products.length} productos (${lastPladeSync.at})`);
   return products.length;
+}
+
+/**
+ * Envía un pedido real a PLADE (savePedidoExterno) después del checkout. Nunca debe tumbar la
+ * respuesta al cliente — el pedido ya quedó guardado localmente (PDF, ubicación, cliente) sin
+ * depender de esto; se llama sin `await` desde /api/orders. Si falta el idPlade de algún producto
+ * (catálogo manual sin sincronizar con PLADE) o no hay tasa BCV en caché, se omite el envío en vez
+ * de mandar una factura incompleta.
+ */
+async function submitOrderToPlade({ orderId, nota, items }) {
+  if (!isPladeConfigured()) return;
+  if (!bcvRateCache || !bcvRateCache.rate) {
+    console.error(`Pedido ${orderId} no se envió a PLADE: no hay tasa BCV en caché.`);
+    return;
+  }
+
+  const catalog = loadProducts();
+  const catalogById = new Map(catalog.map((p) => [p.id, p]));
+  const pladeItems = items.map((item) => {
+    const product = catalogById.get(item.id);
+    if (!product?.idPlade) return null;
+    return { idPlade: product.idPlade, title: item.title, quantity: item.quantity, price: item.price, ivaRate: product.ivaRate || 0 };
+  });
+
+  if (!pladeItems.every(Boolean)) {
+    console.error(`Pedido ${orderId} no se envió a PLADE: algún producto no tiene idPlade (catálogo sin sincronizar).`);
+    return;
+  }
+
+  const result = await saveOrderToPlade({ orderId, nota, bcvRate: bcvRateCache.rate, items: pladeItems });
+  console.log(`Pedido ${orderId} enviado a PLADE: factura ${result.id_factura}`);
 }
 
 if (isPladeConfigured()) {
@@ -815,6 +846,11 @@ app.post('/api/orders', async (req, res) => {
     orderCount: (existing?.orderCount ?? 0) + 1,
   };
   saveCustomers(customers);
+
+  const nota = `${nombre} | ${idType}-${cedula} | Tel: ${telefono} | Correo: ${correo} | ${estado}, ${ciudad}, ${parroquia} | ${address} | Entrega: ${deliveryMethod} | Pago: ${paymentMethod}`;
+  submitOrderToPlade({ orderId, nota, items: normalizedItems }).catch((err) => {
+    console.error(`Error enviando pedido ${orderId} a PLADE:`, err.message);
+  });
 
   res.status(201).json({ ok: true, orderId, pdfUrl });
 });
