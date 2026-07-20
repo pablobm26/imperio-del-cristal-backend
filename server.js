@@ -943,6 +943,25 @@ app.get('/api/products/:id/reviews', (req, res) => {
   res.json(reviews[req.params.id] || []);
 });
 
+// Reseñas positivas recientes de todo el catálogo (no de un solo producto) — para mostrar
+// testimonios reales en el catálogo en vez de contenido inventado. Solo reseñas con comentario
+// (una calificación sin texto no sirve como testimonio) y, por defecto, 4-5 estrellas.
+app.get('/api/reviews/recent', (req, res) => {
+  const reviews = loadReviews();
+  const products = loadProducts();
+  const titleById = new Map(products.map((p) => [p.id, p.title]));
+  const minRating = Math.min(5, Math.max(1, Math.trunc(Number(req.query.minRating)) || 4));
+  const limit = Math.min(20, Math.max(1, Math.trunc(Number(req.query.limit)) || 6));
+
+  const flattened = Object.entries(reviews)
+    .flatMap(([productId, list]) => list.map((r) => ({ ...r, productId, productTitle: titleById.get(productId) || null })))
+    .filter((r) => r.rating >= minRating && r.comment)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+    .slice(0, limit);
+
+  res.json(flattened);
+});
+
 app.post('/api/products/:id/reviews', (req, res) => {
   const products = loadProducts();
   const product = products.find((p) => p.id === req.params.id);
