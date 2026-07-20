@@ -248,16 +248,16 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   if (order.deliveryMethod === 'nationalShipping' && order.courier) {
     doc.text(`Empresa de envío: ${COURIER_LABELS[order.courier] || order.courier}`);
   }
+  if (order.deliveryMethod === 'homeDelivery' && order.deliveryZone) {
+    const zoneLabel = DELIVERY_ZONE_LABELS[order.deliveryZone] || order.deliveryZone;
+    doc.text(`Zona: ${zoneLabel} (+${formatUsd(order.deliveryFee || 0)})`);
+  }
   drawReceiptDivider(doc);
 
   doc.font('Helvetica-Bold').fontSize(9).text('Pago');
   doc.font('Helvetica').fontSize(8);
   doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
   if (order.reference) doc.text(`Referencia: ${order.reference}`);
-  if (order.paymentMethod === 'cash' && order.deliveryZone) {
-    const zoneLabel = DELIVERY_ZONE_LABELS[order.deliveryZone] || order.deliveryZone;
-    doc.text(`Zona de delivery: ${zoneLabel} (+${formatUsd(order.deliveryFee || 0)})`);
-  }
   if (order.paymentMethod === 'pagoMovil' && order.bcvRate) {
     doc.text(`Monto a pagar: ${formatBs(order.total * order.bcvRate)}`);
     doc.text(`(tasa BCV: ${formatBs(order.bcvRate)} por $1)`);
@@ -882,7 +882,7 @@ app.post('/api/orders', async (req, res) => {
   };
   saveCustomers(customers);
 
-  const zoneNote = paymentMethod === 'cash' && deliveryZone ? ` | Zona delivery: ${DELIVERY_ZONE_LABELS[deliveryZone] || deliveryZone} (+$${deliveryFee})` : '';
+  const zoneNote = deliveryMethod === 'homeDelivery' && deliveryZone ? ` | Zona delivery: ${DELIVERY_ZONE_LABELS[deliveryZone] || deliveryZone} (+$${deliveryFee})` : '';
   const nota = `${nombre} | ${idType}-${cedula} | Tel: ${telefono} | Correo: ${correo} | ${estado}, ${ciudad}, ${parroquia} | ${address} | Entrega: ${deliveryMethod} | Pago: ${paymentMethod}${zoneNote}`;
   submitOrderToPlade({ orderId, nota, items: normalizedItems }).catch((err) => {
     console.error(`Error enviando pedido ${orderId} a PLADE:`, err.message);
