@@ -163,14 +163,22 @@ const PICKUP_STORE_LABELS = {
   avUniversidad: 'Sede Av. Universidad — C.C. La Granja',
 };
 const PAYMENT_METHOD_LABELS = {
-  card: 'Tarjeta de crédito/débito',
+  card: 'Tarjeta de Crédito/Débito',
   cash: 'Efectivo contra entrega',
-  zinli: 'Zinli',
-  zelle: 'Zelle',
+  zinli: 'Zinli (Panamá)',
+  zelle: 'Zelle (USD)',
   binance: 'Binance (USDT)',
-  pagoMovil: 'Pago Móvil (Venezuela)',
+  pagoMovil: 'Pago Móvil (Bs)',
 };
 const COURIER_LABELS = { mrw: 'MRW', zoom: 'Zoom', tealca: 'Tealca' };
+// Espejo de tienda_web/lib/delivery-zones.ts — solo aplica cuando paymentMethod es "cash".
+const DELIVERY_ZONE_LABELS = {
+  valencia: 'Valencia',
+  naguanagua: 'Naguanagua',
+  sanDiego: 'San Diego',
+  guacaraFlorAmarillo: 'Guacara y Flor Amarillo',
+  libertadorTocuyito: 'Libertador/Tocuyito',
+};
 
 function formatUsd(amount) {
   return `$${Number(amount).toFixed(2)}`;
@@ -246,6 +254,10 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   doc.font('Helvetica').fontSize(8);
   doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
   if (order.reference) doc.text(`Referencia: ${order.reference}`);
+  if (order.paymentMethod === 'cash' && order.deliveryZone) {
+    const zoneLabel = DELIVERY_ZONE_LABELS[order.deliveryZone] || order.deliveryZone;
+    doc.text(`Zona de delivery: ${zoneLabel} (+${formatUsd(order.deliveryFee || 0)})`);
+  }
   if (order.paymentMethod === 'pagoMovil' && order.bcvRate) {
     doc.text(`Monto a pagar: ${formatBs(order.total * order.bcvRate)}`);
     doc.text(`(tasa BCV: ${formatBs(order.bcvRate)} por $1)`);
@@ -788,6 +800,8 @@ app.post('/api/orders', async (req, res) => {
   const reference = body.reference ? String(body.reference).trim() : '';
   const pickupStore = body.pickupStore ? String(body.pickupStore) : '';
   const courier = body.courier ? String(body.courier) : '';
+  const deliveryZone = body.deliveryZone ? String(body.deliveryZone) : '';
+  const deliveryFee = Number.isFinite(Number(body.deliveryFee)) && Number(body.deliveryFee) > 0 ? Number(body.deliveryFee) : 0;
   const items = Array.isArray(body.items) ? body.items : [];
   const total = Number(body.total);
   const bcvRate = Number.isFinite(Number(body.bcvRate)) && Number(body.bcvRate) > 0 ? Number(body.bcvRate) : null;
@@ -828,6 +842,8 @@ app.post('/api/orders', async (req, res) => {
       courier,
       paymentMethod,
       reference,
+      deliveryZone,
+      deliveryFee,
       items: normalizedItems,
       total,
       bcvRate,
@@ -866,7 +882,8 @@ app.post('/api/orders', async (req, res) => {
   };
   saveCustomers(customers);
 
-  const nota = `${nombre} | ${idType}-${cedula} | Tel: ${telefono} | Correo: ${correo} | ${estado}, ${ciudad}, ${parroquia} | ${address} | Entrega: ${deliveryMethod} | Pago: ${paymentMethod}`;
+  const zoneNote = paymentMethod === 'cash' && deliveryZone ? ` | Zona delivery: ${DELIVERY_ZONE_LABELS[deliveryZone] || deliveryZone} (+$${deliveryFee})` : '';
+  const nota = `${nombre} | ${idType}-${cedula} | Tel: ${telefono} | Correo: ${correo} | ${estado}, ${ciudad}, ${parroquia} | ${address} | Entrega: ${deliveryMethod} | Pago: ${paymentMethod}${zoneNote}`;
   submitOrderToPlade({ orderId, nota, items: normalizedItems }).catch((err) => {
     console.error(`Error enviando pedido ${orderId} a PLADE:`, err.message);
   });
