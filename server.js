@@ -390,8 +390,12 @@ async function syncProductsFromPlade() {
  * (catálogo manual sin sincronizar con PLADE) o no hay tasa BCV en caché, se omite el envío en vez
  * de mandar una factura incompleta.
  */
-async function submitOrderToPlade({ orderId, nota, items }) {
+async function submitOrderToPlade({ orderId, nota, items, country }) {
   if (!isPladeConfigured()) return;
+  if (country && country !== 'VE') {
+    console.log(`Pedido ${orderId} no se envía a PLADE: es de ${country}, PLADE solo factura ventas de Venezuela.`);
+    return;
+  }
   if (!bcvRateCache || !bcvRateCache.rate) {
     console.error(`Pedido ${orderId} no se envió a PLADE: no hay tasa BCV en caché.`);
     return;
@@ -486,6 +490,57 @@ setInterval(() => {
     console.error('Error en consulta periódica al BCV:', err.message);
   });
 }, BCV_SYNC_INTERVAL_MS);
+
+// --- TRM (pesos colombianos por dólar) ---
+// Mismo patrón que la tasa BCV: se cachea en memoria y se refresca cada 30 min en vez de consultar
+// en cada request. A diferencia de bcv.org.ve, datos.gov.co tiene un certificado TLS válido, así que
+// no hace falta desactivar la verificación. Fuente: dataset oficial "TRM Historico" de datos.gov.co,
+// certificado por la Superintendencia Financiera de Colombia con base en operaciones del Banco de la
+// República.
+const TRM_URL = 'https://www.datos.gov.co/resource/32sa-8pi3.json?$order=vigenciadesde%20DESC&$limit=1';
+const TRM_SYNC_INTERVAL_MS = 30 * 60 * 1000;
+let trmRateCache = null; // { rate: number, at: string } | { error: string, at: string }
+
+function fetchTrmJson() {
+  return new Promise((resolve, reject) => {
+    const req = https.get(TRM_URL, (res) => {
+      if (!res.statusCode || res.statusCode >= 400) {
+        reject(new Error(`No se pudo obtener la TRM (${res.statusCode})`));
+        res.resume();
+        return;
+      }
+      let data = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve(data));
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => req.destroy(new Error('Tiempo de espera agotado consultando la TRM')));
+  });
+}
+
+async function syncTrmRate() {
+  const json = await fetchTrmJson();
+  const body = JSON.parse(json);
+  const valorText = body?.[0]?.valor;
+  const rate = parseFloat(valorText);
+  if (!Number.isFinite(rate)) throw new Error(`Formato de TRM inesperado: ${valorText}`);
+
+  trmRateCache = { rate, at: new Date().toISOString() };
+  console.log(`TRM actualizada: ${rate} (${trmRateCache.at})`);
+  return rate;
+}
+
+syncTrmRate().catch((err) => {
+  trmRateCache = { error: err.message, at: new Date().toISOString() };
+  console.error('Error en consulta inicial a la TRM:', err.message);
+});
+setInterval(() => {
+  syncTrmRate().catch((err) => {
+    trmRateCache = { error: err.message, at: new Date().toISOString() };
+    console.error('Error en consulta periódica a la TRM:', err.message);
+  });
+}, TRM_SYNC_INTERVAL_MS);
 
 // --- Routes ---
 
@@ -802,6 +857,7 @@ app.post('/api/orders', async (req, res) => {
   const courier = body.courier ? String(body.courier) : '';
   const deliveryZone = body.deliveryZone ? String(body.deliveryZone) : '';
   const deliveryFee = Number.isFinite(Number(body.deliveryFee)) && Number(body.deliveryFee) > 0 ? Number(body.deliveryFee) : 0;
+  const country = String(body.country ?? 'VE').trim() || 'VE';
   const items = Array.isArray(body.items) ? body.items : [];
   const total = Number(body.total);
   const bcvRate = Number.isFinite(Number(body.bcvRate)) && Number(body.bcvRate) > 0 ? Number(body.bcvRate) : null;
@@ -884,7 +940,7 @@ app.post('/api/orders', async (req, res) => {
 
   const zoneNote = deliveryMethod === 'homeDelivery' && deliveryZone ? ` | Zona delivery: ${DELIVERY_ZONE_LABELS[deliveryZone] || deliveryZone} (+$${deliveryFee})` : '';
   const nota = `${nombre} | ${idType}-${cedula} | Tel: ${telefono} | Correo: ${correo} | ${estado}, ${ciudad}, ${parroquia} | ${address} | Entrega: ${deliveryMethod} | Pago: ${paymentMethod}${zoneNote}`;
-  submitOrderToPlade({ orderId, nota, items: normalizedItems }).catch((err) => {
+  submitOrderToPlade({ orderId, nota, items: normalizedItems, country }).catch((err) => {
     console.error(`Error enviando pedido ${orderId} a PLADE:`, err.message);
   });
 
@@ -1047,6 +1103,16 @@ app.get('/api/bcv', (req, res) => {
     return res.status(502).json({ error: bcvRateCache.error });
   }
   res.json({ rate: bcvRateCache.rate });
+});
+
+app.get('/api/trm', (req, res) => {
+  if (!trmRateCache) {
+    return res.status(503).json({ error: 'Todavía no se ha consultado la TRM en esta sesión del servidor.' });
+  }
+  if (trmRateCache.error) {
+    return res.status(502).json({ error: trmRateCache.error });
+  }
+  res.json({ rate: trmRateCache.rate });
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
