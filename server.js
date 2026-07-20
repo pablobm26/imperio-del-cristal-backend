@@ -157,20 +157,48 @@ const DELIVERY_METHOD_LABELS = {
   pickup: 'Retiro en tienda (Pickup)',
   homeDelivery: 'Delivery a domicilio (Gran Valencia)',
   nationalShipping: 'Envío nacional',
+  internationalShipping: 'Envío internacional',
 };
+// Espejo de tienda_web/lib/pickup-stores.ts (PICKUP_STORES_BY_COUNTRY, todas las sedes).
 const PICKUP_STORE_LABELS = {
   avBolivarNorte: 'Sede Valencia, C.C. Salva Market',
   avUniversidad: 'Sede Naguanagua, C.C. La Granja',
+  miami: 'Sede Miami, Miami, Florida',
+  bogota: 'Sede Bogotá, Bogotá',
+  medellin: 'Sede Medellín, Medellín',
 };
+// Espejo de tienda_web/lib/payment-methods.ts (PAYMENT_METHODS_BY_COUNTRY, los 3 países).
 const PAYMENT_METHOD_LABELS = {
+  pagoMovil: 'Pago Móvil (Bs)',
   card: 'Tarjeta de Crédito/Débito',
-  cash: 'Efectivo contra entrega',
+  binance: 'Binance (USDT)',
   zinli: 'Zinli (Panamá)',
   zelle: 'Zelle (USD)',
-  binance: 'Binance (USDT)',
-  pagoMovil: 'Pago Móvil (Bs)',
+  cash: 'Efectivo contra entrega',
+  boaTransfer: 'Transferencia Bank of America',
+  paypal: 'PayPal',
+  bizum: 'Bizum (Euro)',
+  bancolombia: 'Bancolombia',
+  nequi: 'Nequi',
+  binanceUsdt: 'Binance (USDT)',
 };
-const COURIER_LABELS = { mrw: 'MRW', zoom: 'Zoom', tealca: 'Tealca' };
+// Espejo de tienda_web/lib/couriers.ts (COURIERS_BY_COUNTRY + INTERNATIONAL_COURIERS).
+const COURIER_LABELS = {
+  mrw: 'MRW',
+  zoom: 'Zoom',
+  tealca: 'Tealca',
+  usps: 'USPS',
+  ups: 'UPS',
+  fedex: 'FedEx',
+  dhl: 'DHL',
+  servientrega: 'Servientrega',
+  coordinadora: 'Coordinadora',
+  tcc: 'TCC',
+  envia: 'Envía',
+  dhlExpress: 'DHL Express',
+  fedexInternational: 'FedEx International',
+  upsWorldwide: 'UPS Worldwide',
+};
 // Espejo de tienda_web/lib/delivery-zones.ts — solo aplica cuando paymentMethod es "cash".
 const DELIVERY_ZONE_LABELS = {
   valencia: 'Valencia',
@@ -245,8 +273,11 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   if (order.deliveryMethod === 'pickup' && order.pickupStore) {
     doc.text(`Sede: ${PICKUP_STORE_LABELS[order.pickupStore] || order.pickupStore}`);
   }
-  if (order.deliveryMethod === 'nationalShipping' && order.courier) {
+  if ((order.deliveryMethod === 'nationalShipping' || order.deliveryMethod === 'internationalShipping') && order.courier) {
     doc.text(`Empresa de envío: ${COURIER_LABELS[order.courier] || order.courier}`);
+  }
+  if (order.deliveryMethod === 'internationalShipping' && order.destinationCountry) {
+    doc.text(`País de destino: ${order.destinationCountry}`);
   }
   if (order.deliveryMethod === 'homeDelivery' && order.deliveryZone) {
     const zoneLabel = DELIVERY_ZONE_LABELS[order.deliveryZone] || order.deliveryZone;
@@ -857,6 +888,7 @@ app.post('/api/orders', async (req, res) => {
   const courier = body.courier ? String(body.courier) : '';
   const deliveryZone = body.deliveryZone ? String(body.deliveryZone) : '';
   const deliveryFee = Number.isFinite(Number(body.deliveryFee)) && Number(body.deliveryFee) > 0 ? Number(body.deliveryFee) : 0;
+  const destinationCountry = body.destinationCountry ? String(body.destinationCountry).trim() : '';
   const country = String(body.country ?? 'VE').trim() || 'VE';
   const items = Array.isArray(body.items) ? body.items : [];
   const total = Number(body.total);
@@ -896,6 +928,7 @@ app.post('/api/orders', async (req, res) => {
       deliveryMethod,
       pickupStore,
       courier,
+      destinationCountry,
       paymentMethod,
       reference,
       deliveryZone,
