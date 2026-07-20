@@ -159,8 +159,8 @@ const DELIVERY_METHOD_LABELS = {
   nationalShipping: 'Envío nacional',
 };
 const PICKUP_STORE_LABELS = {
-  avBolivarNorte: 'Sede Av. Bolívar Norte, Valencia — C.C. SALMA',
-  avUniversidad: 'Sede Av. Universidad — C.C. La Granja',
+  avBolivarNorte: 'Sede Valencia, C.C. Salva Market',
+  avUniversidad: 'Sede Naguanagua, C.C. La Granja',
 };
 const PAYMENT_METHOD_LABELS = {
   card: 'Tarjeta de Crédito/Débito',
