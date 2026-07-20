@@ -226,6 +226,19 @@ function formatBs(amount) {
   return `Bs ${grouped},${decimals}`;
 }
 
+// Peso colombiano: sin decimales, miles con punto — igual que tienda_web/lib/format.ts.
+function formatCop(amount) {
+  const rounded = Math.round(Number(amount));
+  const digits = String(rounded);
+  let grouped = '';
+  for (let i = 0; i < digits.length; i++) {
+    const posFromEnd = digits.length - i;
+    grouped += digits[i];
+    if (posFromEnd > 1 && posFromEnd % 3 === 1) grouped += '.';
+  }
+  return `COP ${grouped}`;
+}
+
 // 1mm en puntos PDF (72 puntos por pulgada, 25.4mm por pulgada).
 function mm(value) {
   return (value * 72) / 25.4;
@@ -307,7 +320,11 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   drawReceiptDivider(doc);
 
   doc.font('Helvetica-Bold').fontSize(11).text(`Total: ${formatUsd(order.total)}`, { align: 'right' });
-  if (order.bcvRate) {
+  // La moneda secundaria del total depende del país del pedido: Bs solo para Venezuela, COP solo
+  // para Colombia, ninguna para EEUU (aunque el request traiga bcvRate/trmRate, el país manda).
+  if (order.country === 'CO' && order.trmRate) {
+    doc.font('Helvetica').fontSize(8).fillColor('#666').text(`(${formatCop(order.total * order.trmRate)})`, { align: 'right' });
+  } else if (order.country !== 'US' && order.country !== 'CO' && order.bcvRate) {
     doc.font('Helvetica').fontSize(8).fillColor('#666').text(`(${formatBs(order.total * order.bcvRate)})`, { align: 'right' });
   }
 
@@ -893,6 +910,7 @@ app.post('/api/orders', async (req, res) => {
   const items = Array.isArray(body.items) ? body.items : [];
   const total = Number(body.total);
   const bcvRate = Number.isFinite(Number(body.bcvRate)) && Number(body.bcvRate) > 0 ? Number(body.bcvRate) : null;
+  const trmRate = Number.isFinite(Number(body.trmRate)) && Number(body.trmRate) > 0 ? Number(body.trmRate) : null;
 
   if (!estado || !ciudad || !parroquia || !address || !cedula || !telefono || !correo) {
     return res.status(400).json({ error: 'Faltan campos requeridos.' });
@@ -916,6 +934,7 @@ app.post('/api/orders', async (req, res) => {
     const pdfBuffer = await generateOrderPdfBuffer({
       orderId,
       createdAt,
+      country,
       nombre,
       idType,
       cedula,
@@ -936,6 +955,7 @@ app.post('/api/orders', async (req, res) => {
       items: normalizedItems,
       total,
       bcvRate,
+      trmRate,
     });
     fs.writeFileSync(path.join(ORDERS_PDF_DIR, `${orderId}.pdf`), pdfBuffer);
     pdfUrl = `/api/orders/${orderId}/pdf`;
