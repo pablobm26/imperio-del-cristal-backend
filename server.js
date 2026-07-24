@@ -10,6 +10,7 @@ const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade } = require('./plade-marketplade-client');
+const { isLoyaltyConfigured, getLoyaltyForUser, recordPurchase } = require('./supabase-admin');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -318,6 +319,16 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
     doc.moveDown(0.3);
   }
   drawReceiptDivider(doc);
+
+  if (order.discountApplied) {
+    const subtotal = order.total + order.discountApplied.amount - (order.deliveryFee || 0);
+    doc.font('Helvetica').fontSize(8).fillColor('#666').text(`Subtotal: ${formatUsd(subtotal)}`, { align: 'right' });
+    doc.text(
+      `Descuento nivel ${order.discountApplied.tier} (-${order.discountApplied.percent}%): -${formatUsd(order.discountApplied.amount)}`,
+      { align: 'right' }
+    );
+    doc.moveDown(0.2);
+  }
 
   doc.font('Helvetica-Bold').fontSize(11).text(`Total: ${formatUsd(order.total)}`, { align: 'right' });
   // La moneda secundaria del total depende del país del pedido: Bs solo para Venezuela, COP solo
@@ -911,6 +922,9 @@ app.post('/api/orders', async (req, res) => {
   const total = Number(body.total);
   const bcvRate = Number.isFinite(Number(body.bcvRate)) && Number(body.bcvRate) > 0 ? Number(body.bcvRate) : null;
   const trmRate = Number.isFinite(Number(body.trmRate)) && Number(body.trmRate) > 0 ? Number(body.trmRate) : null;
+  // Solo el uuid de Supabase — cualquier descuento/nivel que venga del cliente (si viniera) se
+  // ignora por completo más abajo. El backend recalcula el descuento real contra Supabase.
+  const userId = body.userId ? String(body.userId).trim() : '';
 
   if (!estado || !ciudad || !parroquia || !address || !cedula || !telefono || !correo) {
     return res.status(400).json({ error: 'Faltan campos requeridos.' });
@@ -925,6 +939,29 @@ app.post('/api/orders', async (req, res) => {
     quantity: Math.max(1, Math.trunc(Number(item?.quantity) || 1)),
     price: Number(item?.price) || 0,
   }));
+  const merchandiseSubtotal = normalizedItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  const round2 = (n) => Math.round(n * 100) / 100;
+
+  // Nivel de fidelidad: si hay userId, el backend recalcula el total autoritativo contra Supabase
+  // (con la service_role key) en vez de confiar en el `total` que mandó el navegador. Si Supabase
+  // no está configurado o la consulta falla, se degrada a comportamiento de invitado (usa el total
+  // del cliente, sin descuento) en vez de romper el checkout.
+  let finalTotal = total;
+  let discountApplied = null;
+  let loyaltyResolved = false;
+  if (userId && isLoyaltyConfigured()) {
+    try {
+      const loyalty = await getLoyaltyForUser(userId);
+      const discountAmount = round2(merchandiseSubtotal * (loyalty.discountPercent / 100));
+      finalTotal = round2(merchandiseSubtotal - discountAmount + deliveryFee);
+      if (loyalty.discountPercent > 0) {
+        discountApplied = { tier: loyalty.tier, percent: loyalty.discountPercent, amount: discountAmount };
+      }
+      loyaltyResolved = true;
+    } catch (err) {
+      console.error(`No se pudo calcular el nivel de fidelidad para ${userId}:`, err.message);
+    }
+  }
 
   const createdAt = new Date().toISOString();
   const orderId = crypto.randomBytes(16).toString('hex');
@@ -953,9 +990,10 @@ app.post('/api/orders', async (req, res) => {
       deliveryZone,
       deliveryFee,
       items: normalizedItems,
-      total,
+      total: finalTotal,
       bcvRate,
       trmRate,
+      discountApplied,
     });
     fs.writeFileSync(path.join(ORDERS_PDF_DIR, `${orderId}.pdf`), pdfBuffer);
     pdfUrl = `/api/orders/${orderId}/pdf`;
@@ -991,13 +1029,24 @@ app.post('/api/orders', async (req, res) => {
   };
   saveCustomers(customers);
 
+  if (userId && loyaltyResolved) {
+    // Best-effort: no bloquea la respuesta del checkout si falla, mismo espíritu que
+    // submitOrderToPlade() más abajo. amount_usd = subtotal de mercancía ANTES del descuento y sin
+    // el fee de delivery (ver supabase/002_purchases.sql).
+    recordPurchase({ userId, orderId, amountUsd: merchandiseSubtotal, country }).catch((err) => {
+      console.error(`No se pudo registrar la compra ${orderId} para el nivel de fidelidad:`, err.message);
+    });
+  }
+
   const zoneNote = deliveryMethod === 'homeDelivery' && deliveryZone ? ` | Zona delivery: ${DELIVERY_ZONE_LABELS[deliveryZone] || deliveryZone} (+$${deliveryFee})` : '';
   const nota = `${nombre} | ${idType}-${cedula} | Tel: ${telefono} | Correo: ${correo} | ${estado}, ${ciudad}, ${parroquia} | ${address} | Entrega: ${deliveryMethod} | Pago: ${paymentMethod}${zoneNote}`;
+  // A propósito sigue mandando el precio completo de cada ítem, sin el descuento de fidelidad
+  // (decisión del dueño: no se toca la integración con PLADE en este paso — ver HANDOFF/plan).
   submitOrderToPlade({ orderId, nota, items: normalizedItems, country }).catch((err) => {
     console.error(`Error enviando pedido ${orderId} a PLADE:`, err.message);
   });
 
-  res.status(201).json({ ok: true, orderId, pdfUrl });
+  res.status(201).json({ ok: true, orderId, pdfUrl, discountApplied });
 });
 
 // El nombre de archivo es el propio orderId (32 hex chars al azar, no adivinable ni enumerable),
