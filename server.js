@@ -18,6 +18,7 @@ const {
   getPurchase,
   setPurchaseStatus,
 } = require('./supabase-admin');
+const { isCartReminderConfigured, sendAbandonedCartReminders } = require('./email-reminders');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -35,6 +36,10 @@ const ORDERS_FILE = path.join(DATA_DIR, 'orders_location.json');
 const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
 const ORDERS_PDF_DIR = path.join(DATA_DIR, 'orders_pdfs');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+// Secreto separado del ADMIN_PASSWORD para el cron externo que dispara el envío de recordatorios
+// de carrito (/cron/cart-reminders) — así ese secreto puede vivir en la URL configurada en un
+// servicio de cron de terceros sin exponer la contraseña real del panel de administración.
+const CRON_SECRET = process.env.CRON_SECRET;
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PRODUCTS_FILE)) fs.writeFileSync(PRODUCTS_FILE, '[]');
@@ -662,6 +667,18 @@ app.get('/admin', (req, res) => {
   </form>
   ` : ''}
 
+  <div class="status">
+    <b>Recordatorio de carrito abandonado por correo:</b>
+    ${isCartReminderConfigured() ? 'configurado (Resend)' : 'no configurado (faltan RESEND_API_KEY/CART_REMINDER_FROM_EMAIL)'}
+  </div>
+  ${isCartReminderConfigured() ? `
+  <form action="/admin/send-cart-reminders" method="post">
+    <label>Contraseña de administración</label>
+    <input type="password" name="password" required>
+    <button type="submit">Enviar recordatorios ahora</button>
+  </form>
+  ` : ''}
+
   ${products.length ? `
   <table>
     <tr><th>ID</th><th>Nombre</th><th>Precio</th><th>Stock</th><th>Categoría</th></tr>
@@ -1216,6 +1233,53 @@ app.post('/admin/purchases/:id', async (req, res) => {
     res.redirect('/admin/purchases');
   } catch (err) {
     res.status(500).send(`Error actualizando la compra: ${escapeHtml(err.message)}. <a href="/admin/purchases">Volver</a>`);
+  }
+});
+
+// Disparo manual desde el panel de admin (contraseña de siempre) del envío de recordatorios de
+// carrito abandonado. Ver email-reminders.js.
+app.post('/admin/send-cart-reminders', async (req, res) => {
+  if (req.body?.password !== ADMIN_PASSWORD) {
+    return res.status(401).send('Contraseña incorrecta. <a href="/admin">Volver</a>');
+  }
+  if (!isCartReminderConfigured()) {
+    return res.status(400).send('Recordatorio de carrito no configurado (faltan RESEND_API_KEY/CART_REMINDER_FROM_EMAIL/SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY). <a href="/admin">Volver</a>');
+  }
+  try {
+    const result = await sendAbandonedCartReminders();
+    res.send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Recordatorios enviados</title>
+  <style>body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; color: #222; }</style>
+</head>
+<body>
+  <h1>Recordatorios de carrito abandonado</h1>
+  <p>Enviados: <b>${result.sent}</b><br>Sin email válido (omitidos): <b>${result.skipped}</b><br>Con error: <b>${result.failed}</b></p>
+  <p><a href="/admin">&larr; Volver</a></p>
+</body>
+</html>`);
+  } catch (err) {
+    res.status(500).send(`Error: ${escapeHtml(err.message)}. <a href="/admin">Volver</a>`);
+  }
+});
+
+// Mismo envío que arriba, pero pensado para que lo dispare un cron externo (cron-job.org u otro)
+// una vez al día: GET simple con el secreto en la query string, protegido con CRON_SECRET en vez
+// de ADMIN_PASSWORD (ese secreto va a vivir guardado en la config de un servicio de terceros).
+app.get('/cron/cart-reminders', async (req, res) => {
+  if (!CRON_SECRET || req.query.secret !== CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado.' });
+  }
+  if (!isCartReminderConfigured()) {
+    return res.status(400).json({ error: 'Recordatorio de carrito no configurado.' });
+  }
+  try {
+    const result = await sendAbandonedCartReminders();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
