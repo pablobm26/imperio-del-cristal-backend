@@ -10,7 +10,14 @@ const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade } = require('./plade-marketplade-client');
-const { isLoyaltyConfigured, getLoyaltyForUser, recordPurchase } = require('./supabase-admin');
+const {
+  isLoyaltyConfigured,
+  getLoyaltyForUser,
+  recordPurchase,
+  listPurchases,
+  getPurchase,
+  setPurchaseStatus,
+} = require('./supabase-admin');
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -662,7 +669,8 @@ app.get('/admin', (req, res) => {
   </table>
   ${products.length > 20 ? `<p>... y ${products.length - 20} más.</p>` : ''}
   ` : ''}
-  <a class="link-btn" href="/admin/products">Completar/editar especificaciones de productos (material, color, medidas, peso) &rarr;</a>
+  <a class="link-btn" href="/admin/products">Completar/editar especificaciones de productos (material, color, medidas, peso) &rarr;</a><br>
+  <a class="link-btn" href="/admin/purchases">Ver/anular compras del nivel de fidelidad &rarr;</a>
 </body>
 </html>`);
 });
@@ -1092,6 +1100,123 @@ app.post('/admin/customers', (req, res) => {
 
   const customers = loadCustomers();
   res.json({ total: Object.keys(customers).length, customers: Object.values(customers) });
+});
+
+// Panel para anular una compra que nunca se pagó de verdad (referencia falsa, "efectivo" que
+// nunca se cobró) — sin esto, ese pedido seguiría contando para el nivel de fidelidad del
+// cliente para siempre. El order_id de cada fila coincide con el PDF del pedido
+// (/api/orders/:orderId/pdf), así se puede identificar de quién es sin guardar más datos acá.
+app.get('/admin/purchases', async (req, res) => {
+  let purchases = [];
+  let loadError = null;
+  if (isLoyaltyConfigured()) {
+    try {
+      purchases = await listPurchases();
+    } catch (err) {
+      loadError = err.message;
+    }
+  }
+
+  res.send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Compras (nivel de fidelidad)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; color: #222; }
+    h1 { font-size: 1.4rem; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 0.85rem; }
+    th, td { border: 1px solid #e5e7eb; padding: 6px 8px; text-align: left; }
+    .cancelled { color: #b91c1c; }
+    .confirmed { color: #15803d; }
+    a.link-btn { display: inline-block; margin-top: 16px; color: #4f46e5; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Compras registradas (nivel de fidelidad)</h1>
+  ${!isLoyaltyConfigured() ? '<p>Supabase no está configurado (faltan SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY).</p>' : ''}
+  ${loadError ? `<p style="color:#b91c1c">Error cargando compras: ${escapeHtml(loadError)}</p>` : ''}
+  ${purchases.length ? `
+  <table>
+    <tr><th>Fecha</th><th>Pedido</th><th>Monto</th><th>País</th><th>Estado</th><th></th></tr>
+    ${purchases.map((p) => `
+    <tr>
+      <td>${new Date(p.created_at).toLocaleString('es-VE')}</td>
+      <td><a href="/api/orders/${encodeURIComponent(p.order_id)}/pdf" target="_blank">${escapeHtml(p.order_id.slice(0, 12))}…</a></td>
+      <td>${formatUsd(Number(p.amount_usd))}</td>
+      <td>${escapeHtml(p.country)}</td>
+      <td class="${p.status}">${p.status === 'confirmed' ? 'Confirmada' : 'Anulada'}</td>
+      <td><a href="/admin/purchases/${encodeURIComponent(p.id)}">Ver / cambiar</a></td>
+    </tr>`).join('')}
+  </table>
+  ` : (isLoyaltyConfigured() && !loadError ? '<p>Todavía no hay compras registradas.</p>' : '')}
+</body>
+</html>`);
+});
+
+app.get('/admin/purchases/:id', async (req, res) => {
+  if (!isLoyaltyConfigured()) {
+    return res.status(400).send('Supabase no está configurado. <a href="/admin/purchases">Volver</a>');
+  }
+  let purchase;
+  try {
+    purchase = await getPurchase(req.params.id);
+  } catch (err) {
+    return res.status(500).send(`Error: ${escapeHtml(err.message)}. <a href="/admin/purchases">Volver</a>`);
+  }
+  if (!purchase) {
+    return res.status(404).send('Compra no encontrada. <a href="/admin/purchases">Volver</a>');
+  }
+
+  const isConfirmed = purchase.status === 'confirmed';
+  const nextStatus = isConfirmed ? 'cancelled' : 'confirmed';
+  const actionLabel = isConfirmed ? 'Anular esta compra' : 'Restaurar esta compra';
+
+  res.send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Compra ${escapeHtml(purchase.order_id.slice(0, 12))}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 480px; margin: 40px auto; padding: 0 16px; color: #222; }
+    label { display: block; margin-top: 12px; font-weight: 600; }
+    input[type=password] { display: block; margin-top: 4px; padding: 8px; width: 100%; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 10px 20px; background: #b91c1c; color: white; border: none; border-radius: 6px; cursor: pointer; }
+    dl { margin-top: 16px; }
+    dt { font-weight: 600; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Compra ${escapeHtml(purchase.order_id.slice(0, 12))}…</h1>
+  <dl>
+    <dt>Fecha</dt><dd>${new Date(purchase.created_at).toLocaleString('es-VE')}</dd>
+    <dt>Pedido (PDF)</dt><dd><a href="/api/orders/${encodeURIComponent(purchase.order_id)}/pdf" target="_blank">Ver factura del cliente &rarr;</a></dd>
+    <dt>Monto</dt><dd>${formatUsd(Number(purchase.amount_usd))}</dd>
+    <dt>País</dt><dd>${escapeHtml(purchase.country)}</dd>
+    <dt>Estado actual</dt><dd>${isConfirmed ? 'Confirmada (cuenta para el nivel del cliente)' : 'Anulada (no cuenta para el nivel)'}</dd>
+  </dl>
+  <form method="post" action="/admin/purchases/${encodeURIComponent(purchase.id)}">
+    <input type="hidden" name="status" value="${nextStatus}">
+    <label>Contraseña de administración</label>
+    <input type="password" name="password" required>
+    <button type="submit">${actionLabel}</button>
+  </form>
+  <p><a href="/admin/purchases">&larr; Volver</a></p>
+</body>
+</html>`);
+});
+
+app.post('/admin/purchases/:id', async (req, res) => {
+  if (req.body?.password !== ADMIN_PASSWORD) {
+    return res.status(401).send('Contraseña incorrecta. <a href="/admin/purchases">Volver</a>');
+  }
+  const status = req.body?.status === 'confirmed' ? 'confirmed' : 'cancelled';
+  try {
+    await setPurchaseStatus(req.params.id, status);
+    res.redirect('/admin/purchases');
+  } catch (err) {
+    res.status(500).send(`Error actualizando la compra: ${escapeHtml(err.message)}. <a href="/admin/purchases">Volver</a>`);
+  }
 });
 
 const MAX_REVIEW_COMMENT_LENGTH = 120;

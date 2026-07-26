@@ -54,4 +54,43 @@ async function recordPurchase({ userId, orderId, amountUsd, country }) {
   if (error) throw new Error(`Supabase insert purchases: ${error.message}`);
 }
 
-module.exports = { isLoyaltyConfigured, getLoyaltyForUser, recordPurchase };
+/**
+ * Compras recientes, para el panel /admin/purchases (anular pedidos nunca pagados que no deben
+ * seguir contando para el nivel de fidelidad de nadie).
+ */
+async function listPurchases({ limit = 200 } = {}) {
+  if (!supabaseAdmin) return [];
+  const { data, error } = await supabaseAdmin
+    .from('purchases')
+    .select('id, user_id, order_id, amount_usd, country, status, created_at')
+    .order('created_at', { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`Supabase list purchases: ${error.message}`);
+  return data;
+}
+
+async function getPurchase(id) {
+  if (!supabaseAdmin) return null;
+  const { data, error } = await supabaseAdmin
+    .from('purchases')
+    .select('id, user_id, order_id, amount_usd, country, status, created_at')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) throw new Error(`Supabase get purchase: ${error.message}`);
+  return data;
+}
+
+async function setPurchaseStatus(id, status) {
+  if (!supabaseAdmin) throw new Error('Supabase no está configurado.');
+  const { error } = await supabaseAdmin.from('purchases').update({ status }).eq('id', id);
+  if (error) throw new Error(`Supabase update purchase status: ${error.message}`);
+}
+
+module.exports = {
+  isLoyaltyConfigured,
+  getLoyaltyForUser,
+  recordPurchase,
+  listPurchases,
+  getPurchase,
+  setPurchaseStatus,
+};
