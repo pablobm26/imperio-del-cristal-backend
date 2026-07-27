@@ -43,13 +43,14 @@ async function getLoyaltyForUser(userId) {
  * atrapar el error y no bloquear la respuesta del checkout si falla, mismo espíritu que
  * submitOrderToPlade() en server.js.
  */
-async function recordPurchase({ userId, orderId, amountUsd, country }) {
+async function recordPurchase({ userId, orderId, amountUsd, country, paymentMethod }) {
   if (!supabaseAdmin) return;
   const { error } = await supabaseAdmin.from('purchases').insert({
     user_id: userId,
     order_id: orderId,
     amount_usd: amountUsd,
     country,
+    payment_method: paymentMethod || null,
   });
   if (error) throw new Error(`Supabase insert purchases: ${error.message}`);
 }

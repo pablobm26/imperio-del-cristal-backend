@@ -1199,7 +1199,7 @@ app.post('/api/orders', (req, res) => {
     // Best-effort: no bloquea la respuesta del checkout si falla, mismo espíritu que
     // submitOrderToPlade() más abajo. amount_usd = subtotal de mercancía ANTES del descuento y sin
     // el fee de delivery (ver supabase/002_purchases.sql).
-    recordPurchase({ userId, orderId, amountUsd: merchandiseSubtotal, country }).catch((err) => {
+    recordPurchase({ userId, orderId, amountUsd: merchandiseSubtotal, country, paymentMethod }).catch((err) => {
       console.error(`No se pudo registrar la compra ${orderId} para el nivel de fidelidad:`, err.message);
     });
   }
