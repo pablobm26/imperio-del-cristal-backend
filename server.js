@@ -22,6 +22,13 @@ const { isCartReminderConfigured, sendAbandonedCartReminders } = require('./emai
 
 const app = express();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+// Captura del pago que adjunta el cliente en el checkout — límite más chico que el de arriba
+// (pensado para inventario) y solo imágenes, ya que es lo único que tiene sentido pedir acá.
+const uploadPaymentProof = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 8 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => cb(null, /^image\//.test(file.mimetype)),
+});
 
 // Allow the Flutter web build (served from a different origin/port) to call the API.
 app.use('/api', cors());
@@ -35,6 +42,8 @@ const REVIEWS_FILE = path.join(DATA_DIR, 'reviews.json');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders_location.json');
 const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
 const ORDERS_PDF_DIR = path.join(DATA_DIR, 'orders_pdfs');
+const ORDERS_PAYMENT_PROOFS_DIR = path.join(DATA_DIR, 'orders_payment_proofs');
+const ORDERS_RECEIPTS_DIR = path.join(DATA_DIR, 'orders_receipts');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
 // Secreto separado del ADMIN_PASSWORD para el cron externo que dispara el envío de recordatorios
 // de carrito (/cron/cart-reminders) — así ese secreto puede vivir en la URL configurada en un
@@ -48,6 +57,8 @@ if (!fs.existsSync(REVIEWS_FILE)) fs.writeFileSync(REVIEWS_FILE, '{}');
 if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
 if (!fs.existsSync(CUSTOMERS_FILE)) fs.writeFileSync(CUSTOMERS_FILE, '{}');
 if (!fs.existsSync(ORDERS_PDF_DIR)) fs.mkdirSync(ORDERS_PDF_DIR, { recursive: true });
+if (!fs.existsSync(ORDERS_PAYMENT_PROOFS_DIR)) fs.mkdirSync(ORDERS_PAYMENT_PROOFS_DIR, { recursive: true });
+if (!fs.existsSync(ORDERS_RECEIPTS_DIR)) fs.mkdirSync(ORDERS_RECEIPTS_DIR, { recursive: true });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -183,7 +194,6 @@ const PICKUP_STORE_LABELS = {
 // Espejo de tienda_web/lib/payment-methods.ts (PAYMENT_METHODS_BY_COUNTRY, los 3 países).
 const PAYMENT_METHOD_LABELS = {
   pagoMovil: 'Pago Móvil (Bs)',
-  card: 'Tarjeta de Crédito/Débito',
   binance: 'Binance (USDT)',
   zinli: 'Zinli (Panamá)',
   zelle: 'Zelle (USD)',
@@ -315,6 +325,7 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   doc.font('Helvetica').fontSize(8);
   doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
   if (order.reference) doc.text(`Referencia: ${order.reference}`);
+  if (order.paymentHolderName) doc.text(`Titular del pago: ${order.paymentHolderName}`);
   if (order.paymentMethod === 'pagoMovil' && order.bcvRate) {
     doc.text(`Monto a pagar: ${formatBs(order.total * order.bcvRate)}`);
     doc.text(`(tasa BCV: ${formatBs(order.bcvRate)} por $1)`);
@@ -403,6 +414,61 @@ async function generateOrderPdfBuffer(order) {
     doc.on('error', reject);
   });
   drawReceiptBody(doc, order, barcodeBuffer);
+  doc.end();
+  return donePromise;
+}
+
+// Versión "para pantalla" del recibo, con la captura del pago incrustada — NO reemplaza al de
+// arriba (ese sigue siendo el que se imprime en la impresora térmica de la tienda, sin fotos: una
+// captura de pago ahí saldría enorme y en baja calidad, esa impresora es monocromática y angosta).
+// Este otro es tamaño carta normal, pensado para verse en pantalla o mandarse por WhatsApp. Solo
+// se genera cuando el pedido trae una captura adjunta (ver POST /api/orders).
+async function generateReceiptWithProofPdfBuffer(order, proofBuffer) {
+  let barcodeBuffer = null;
+  try {
+    barcodeBuffer = await bwipjs.toBuffer({
+      bcid: 'code128',
+      text: order.orderId,
+      scale: 2,
+      height: 10,
+      includetext: false,
+    });
+  } catch (err) {
+    console.error('No se pudo generar el código de barras del pedido:', err.message);
+  }
+
+  const doc = new PDFDocument({ size: 'A4', margin: mm(15) });
+  const chunks = [];
+  doc.on('data', (chunk) => chunks.push(chunk));
+  const donePromise = new Promise((resolve, reject) => {
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+
+  drawReceiptBody(doc, order, barcodeBuffer);
+
+  doc.addPage();
+  doc.font('Helvetica-Bold').fontSize(12).fillColor('#000').text('Captura del pago', { align: 'center' });
+  doc.moveDown(0.5);
+  try {
+    // pdfkit no soporta todos los formatos de imagen (ej. WEBP, HEIC) — si falla, no se rompe el
+    // resto del comprobante, solo se avisa con texto (la captura original sigue disponible aparte
+    // en GET /api/orders/:orderId/proof).
+    doc.image(proofBuffer, {
+      fit: [
+        doc.page.width - doc.page.margins.left - doc.page.margins.right,
+        doc.page.height - doc.y - doc.page.margins.bottom,
+      ],
+      align: 'center',
+    });
+  } catch (err) {
+    console.error('No se pudo incrustar la captura de pago en el PDF:', err.message);
+    doc.font('Helvetica').fontSize(9).fillColor('#b91c1c').text(
+      'No se pudo mostrar la captura acá (formato de imagen no compatible). Sigue disponible en el link de la captura original.',
+      { align: 'center' }
+    );
+  }
+
   doc.end();
   return donePromise;
 }
@@ -919,7 +985,15 @@ const isOrderRateLimited = makeRateLimiter(10, 60 * 60 * 1000); // 10 pedidos/ho
 // Registro interno (no es un backend de pedidos real, ver checkout simulado): guarda ESTADO/CIUDAD/
 // PARROQUIA para estadística de ventas por ubicación, y CEDULA/TELEFONO/CORREO en una lista de
 // clientes deduplicada para poder contactarlos a futuro (publicidad, avisos).
-app.post('/api/orders', async (req, res) => {
+// Uso multer directo adentro del handler (en vez de como middleware de ruta) para poder
+// convertir un error suyo (imagen demasiado pesada, tipo de archivo no permitido) en una
+// respuesta JSON prolija en vez de que caiga en el manejador de errores HTML por default de
+// Express — no hay ningún middleware de errores general en este servidor.
+app.post('/api/orders', (req, res) => {
+  uploadPaymentProof.single('paymentProof')(req, res, async (uploadErr) => {
+  if (uploadErr) {
+    return res.status(400).json({ error: 'La captura del pago no se pudo subir (¿pesa más de 8MB o no es una imagen?).' });
+  }
   if (isOrderRateLimited(req.ip)) {
     return res.status(429).json({ error: 'Demasiados pedidos registrados. Intenta de nuevo más tarde.' });
   }
@@ -937,13 +1011,22 @@ app.post('/api/orders', async (req, res) => {
   const deliveryMethod = String(body.deliveryMethod ?? '');
   const paymentMethod = String(body.paymentMethod ?? '');
   const reference = body.reference ? String(body.reference).trim() : '';
+  const paymentHolderName = body.paymentHolderName ? String(body.paymentHolderName).trim() : '';
   const pickupStore = body.pickupStore ? String(body.pickupStore) : '';
   const courier = body.courier ? String(body.courier) : '';
   const deliveryZone = body.deliveryZone ? String(body.deliveryZone) : '';
   const deliveryFee = Number.isFinite(Number(body.deliveryFee)) && Number(body.deliveryFee) > 0 ? Number(body.deliveryFee) : 0;
   const destinationCountry = body.destinationCountry ? String(body.destinationCountry).trim() : '';
   const country = String(body.country ?? 'VE').trim() || 'VE';
-  const items = Array.isArray(body.items) ? body.items : [];
+  // Va como string JSON dentro del multipart (el archivo adjunto obliga a mandar el pedido como
+  // form-data en vez de JSON puro — ver submitOrder() en tienda_web/lib/api.ts).
+  let items;
+  try {
+    items = JSON.parse(body.items || '[]');
+  } catch {
+    items = [];
+  }
+  if (!Array.isArray(items)) items = [];
   const total = Number(body.total);
   const bcvRate = Number.isFinite(Number(body.bcvRate)) && Number(body.bcvRate) > 0 ? Number(body.bcvRate) : null;
   const trmRate = Number.isFinite(Number(body.trmRate)) && Number(body.trmRate) > 0 ? Number(body.trmRate) : null;
@@ -956,6 +1039,10 @@ app.post('/api/orders', async (req, res) => {
   }
   if (items.length === 0 || !Number.isFinite(total)) {
     return res.status(400).json({ error: 'Faltan los productos o el total del pedido.' });
+  }
+  // Efectivo se paga al recibir el pedido — no hay captura de pago que pedir en ese momento.
+  if (paymentMethod !== 'cash' && !req.file) {
+    return res.status(400).json({ error: 'Falta la captura del pago.' });
   }
 
   const normalizedItems = items.map((item) => ({
@@ -991,6 +1078,13 @@ app.post('/api/orders', async (req, res) => {
   const createdAt = new Date().toISOString();
   const orderId = crypto.randomBytes(16).toString('hex');
 
+  let proofUrl = null;
+  if (req.file) {
+    const ext = req.file.mimetype === 'image/png' ? '.png' : req.file.mimetype === 'image/webp' ? '.webp' : '.jpg';
+    fs.writeFileSync(path.join(ORDERS_PAYMENT_PROOFS_DIR, `${orderId}${ext}`), req.file.buffer);
+    proofUrl = `/api/orders/${orderId}/proof`;
+  }
+
   let pdfUrl = null;
   try {
     const pdfBuffer = await generateOrderPdfBuffer({
@@ -1012,6 +1106,7 @@ app.post('/api/orders', async (req, res) => {
       destinationCountry,
       paymentMethod,
       reference,
+      paymentHolderName,
       deliveryZone,
       deliveryFee,
       items: normalizedItems,
@@ -1026,6 +1121,48 @@ app.post('/api/orders', async (req, res) => {
     console.error('No se pudo generar el PDF del pedido:', err.message);
   }
 
+  // Solo tiene sentido si hay captura de pago adjunta (efectivo no genera este segundo PDF).
+  let receiptUrl = null;
+  if (req.file) {
+    try {
+      const receiptBuffer = await generateReceiptWithProofPdfBuffer(
+        {
+          orderId,
+          createdAt,
+          country,
+          nombre,
+          idType,
+          cedula,
+          telefono,
+          correo,
+          estado,
+          ciudad,
+          parroquia,
+          address,
+          deliveryMethod,
+          pickupStore,
+          courier,
+          destinationCountry,
+          paymentMethod,
+          reference,
+          paymentHolderName,
+          deliveryZone,
+          deliveryFee,
+          items: normalizedItems,
+          total: finalTotal,
+          bcvRate,
+          trmRate,
+          discountApplied,
+        },
+        req.file.buffer
+      );
+      fs.writeFileSync(path.join(ORDERS_RECEIPTS_DIR, `${orderId}.pdf`), receiptBuffer);
+      receiptUrl = `/api/orders/${orderId}/receipt`;
+    } catch (err) {
+      console.error('No se pudo generar el comprobante con la captura de pago:', err.message);
+    }
+  }
+
   const orders = loadOrdersLocation();
   orders.push({
     orderId,
@@ -1034,7 +1171,11 @@ app.post('/api/orders', async (req, res) => {
     parroquia,
     deliveryMethod,
     paymentMethod,
+    reference,
+    paymentHolderName,
     pdfUrl,
+    proofUrl,
+    receiptUrl,
     createdAt,
   });
   saveOrdersLocation(orders);
@@ -1071,7 +1212,8 @@ app.post('/api/orders', async (req, res) => {
     console.error(`Error enviando pedido ${orderId} a PLADE:`, err.message);
   });
 
-  res.status(201).json({ ok: true, orderId, pdfUrl, discountApplied });
+  res.status(201).json({ ok: true, orderId, pdfUrl, proofUrl, receiptUrl, discountApplied });
+  });
 });
 
 // El nombre de archivo es el propio orderId (32 hex chars al azar, no adivinable ni enumerable),
@@ -1087,6 +1229,40 @@ app.get('/api/orders/:orderId/pdf', (req, res) => {
   }
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="pedido-${req.params.orderId.slice(0, 8)}.pdf"`);
+  fs.createReadStream(filePath).pipe(res);
+});
+
+// Misma lógica de acceso que el PDF de arriba (orderId al azar como token). La extensión real no
+// va en la URL (el cliente no la elige) — se prueba cada una hasta encontrar el archivo guardado.
+const PROOF_CONTENT_TYPES = { '.jpg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp' };
+app.get('/api/orders/:orderId/proof', (req, res) => {
+  if (!/^[a-f0-9]{32}$/.test(req.params.orderId)) {
+    return res.status(400).json({ error: 'ID de pedido inválido.' });
+  }
+  const ext = Object.keys(PROOF_CONTENT_TYPES).find((e) =>
+    fs.existsSync(path.join(ORDERS_PAYMENT_PROOFS_DIR, `${req.params.orderId}${e}`))
+  );
+  if (!ext) {
+    return res.status(404).json({ error: 'Captura de pago no encontrada.' });
+  }
+  const filePath = path.join(ORDERS_PAYMENT_PROOFS_DIR, `${req.params.orderId}${ext}`);
+  res.setHeader('Content-Type', PROOF_CONTENT_TYPES[ext]);
+  fs.createReadStream(filePath).pipe(res);
+});
+
+// Comprobante "para pantalla" (tamaño carta, con la captura del pago incrustada) — distinto del
+// /pdf de arriba (ese es el térmico angosto, sin fotos, el que se imprime en tienda). Mismo
+// esquema de acceso (orderId al azar como token).
+app.get('/api/orders/:orderId/receipt', (req, res) => {
+  if (!/^[a-f0-9]{32}$/.test(req.params.orderId)) {
+    return res.status(400).json({ error: 'ID de pedido inválido.' });
+  }
+  const filePath = path.join(ORDERS_RECEIPTS_DIR, `${req.params.orderId}.pdf`);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Comprobante no encontrado.' });
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="comprobante-${req.params.orderId.slice(0, 8)}.pdf"`);
   fs.createReadStream(filePath).pipe(res);
 });
 
