@@ -44,18 +44,74 @@ function normalizeForSearch(value) {
     .replace(/[̀-ͯ]/g, '');
 }
 
+// Palabras de relleno de una pregunta en español que NO aportan nada para buscar en el catálogo
+// ("tienen", "para", "de", "mi"...) — sin este filtro, una consulta como "tienen aretes de plata"
+// terminaba matcheando por la palabra suelta "de" (aparece en miles de títulos) y devolvía
+// productos al azar sin relación real con lo que pidió el cliente.
+const STOPWORDS = new Set([
+  'de', 'del', 'la', 'el', 'los', 'las', 'un', 'una', 'unos', 'unas', 'y', 'o', 'a', 'al', 'en',
+  'con', 'sin', 'por', 'para', 'que', 'como', 'mi', 'tu', 'su', 'sus', 'me', 'te', 'se', 'lo', 'le',
+  'les', 'es', 'son', 'hay', 'tienen', 'tiene', 'tienes', 'tenes', 'busco', 'buscando', 'quiero',
+  'quisiera', 'necesito', 'algo', 'alguna', 'algun', 'algunos', 'algunas', 'este', 'esta', 'ese',
+  'esa', 'eso', 'esto', 'mas', 'muy', 'bien', 'buen', 'buena', 'favor', 'porfa', 'porfavor',
+  'disponible', 'disponibles', 'precio', 'precios', 'cuanto', 'cuesta', 'cuestan', 'vale', 'valen',
+  'hola', 'buenas', 'buenos',
+]);
+
+// El cliente no siempre usa la misma palabra que el catálogo — "aretes"/"sortija"/"plata" no
+// existen ni una sola vez en los +8000 títulos (usan "zarcillo"/"anillo"/"silver"), así que sin
+// esto esas búsquedas daban 0 resultados por más que el producto sí exista. Verificado contra el
+// catálogo real antes de escribir esto.
+const SYNONYMS = {
+  arete: ['zarcillo'], aretes: ['zarcillos'], pantalla: ['zarcillo'], pantallas: ['zarcillos'],
+  zarcillo: ['arete'], zarcillos: ['aretes'],
+  brazalete: ['pulsera'], brazaletes: ['pulseras'], pulsera: ['brazalete'], pulseras: ['brazaletes'],
+  sortija: ['anillo'], sortijas: ['anillos'], anillo: ['sortija'], anillos: ['sortijas'],
+  plata: ['silver'], plateado: ['silver'], plateada: ['silver'], plateados: ['silver'], plateadas: ['silver'],
+  dorado: ['oro', 'goldfield'], dorada: ['oro', 'goldfield'], oro: ['dorado', 'goldfield'],
+  colgante: ['dije'], colgantes: ['dijes'],
+  collar: ['cadena'], collares: ['cadenas'], cadena: ['collar'], cadenas: ['collares'],
+};
+
+// Solo saca la "s" final — cubre pulseras/anillos/dijes/zarcillos/sortijas/cadenas (todos terminan
+// en vocal, la inmensa mayoría de los nombres de tipo de producto de este catálogo). No intenta
+// adivinar el caso "-es" de sustantivos terminados en consonante (flor/flores, collar/collares) —
+// es ambiguo sin diccionario y esos casos puntuales ya están cubiertos a mano como claves propias
+// en SYNONYMS.
+function singularize(token) {
+  if (token.length > 3 && token.endsWith('s')) return token.slice(0, -1);
+  return token;
+}
+
+function expandToken(token) {
+  const base = singularize(token);
+  const candidates = new Set([token, base]);
+  for (const c of [token, base]) {
+    if (SYNONYMS[c]) SYNONYMS[c].forEach((s) => candidates.add(s));
+  }
+  return Array.from(candidates);
+}
+
 // Busca en el catálogo completo los productos relevantes para la consulta del cliente: cada
-// palabra de la consulta tiene que aparecer en el título o la categoría (en cualquier orden), y
-// se ordenan por cuántas palabras coincidieron. Así, si preguntan por "hilo militar", el asistente
-// SÍ ve "HILO CHINO VERDE MILITAR 50 M" aunque esa frase exacta no exista, en vez de depender de
-// que ese producto haya caído dentro de los primeros N del catálogo (que antes era arbitrario).
+// palabra "de contenido" (sin stopwords) tiene que aparecer —ella, su singular/plural, o un
+// sinónimo conocido— en el título o la categoría (en cualquier orden), y se ordenan por cuántas
+// palabras distintas coincidieron. Así, si preguntan por "hilo militar", el asistente SÍ ve
+// "HILO CHINO VERDE MILITAR 50 M" aunque esa frase exacta no exista, en vez de depender de que ese
+// producto haya caído dentro de los primeros N del catálogo (que antes era arbitrario).
 function findRelevantProducts(products, query, limit) {
-  const tokens = normalizeForSearch(query).split(/\s+/).filter((t) => t.length > 1);
-  if (tokens.length === 0) return [];
+  // Separa por cualquier caracter que no sea letra/número (no solo espacios) — un cliente
+  // escribe "tienen acrilico?" o "¿tienen zarcillos?" pegado, sin espacio antes del signo, y
+  // separar solo por \s+ dejaba el token como "acrilico?" (con el símbolo incluido), que no
+  // coincidía con nada del catálogo aunque el producto sí existiera.
+  const rawTokens = normalizeForSearch(query)
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 2 && !STOPWORDS.has(t));
+  if (rawTokens.length === 0) return [];
+  const tokenGroups = rawTokens.map(expandToken);
   const scored = [];
   for (const p of products) {
     const haystack = normalizeForSearch(`${p.title} ${p.category}`);
-    const score = tokens.filter((t) => haystack.includes(t)).length;
+    const score = tokenGroups.filter((group) => group.some((c) => haystack.includes(c))).length;
     if (score > 0) scored.push({ product: p, score });
   }
   scored.sort((a, b) => b.score - a.score);
@@ -91,13 +147,14 @@ ESTADO DE ATENCIÓN HUMANA AHORA MISMO: ${
 INVENTARIO ACTUAL ${inventoryContextNote} — única fuente de verdad sobre productos, precios y disponibilidad; nunca inventes productos que no estén en esta lista:
 ${productLines || '(No hay productos cargados actualmente)'}
 
-MÉTODOS DE PAGO ACEPTADOS:
-- Tarjeta de crédito/débito (dentro de la app)
-- Efectivo contra entrega
+MÉTODOS DE PAGO ACEPTADOS (ya no se acepta tarjeta, se sacó del checkout):
+- Efectivo contra entrega (único método sin captura de pago)
 - Zinli: ${PaymentInfo.zinliEmail}
 - Zelle: ${PaymentInfo.zelleEmail} (titular: ${PaymentInfo.zelleHolder})
 - Binance Pay ID (USDT): ${PaymentInfo.binancePayId}
 - Pago Móvil: Teléfono ${PaymentInfo.pagoMovilPhone}, Cédula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}
+
+Para todos los métodos excepto efectivo, el checkout le va a pedir al cliente adjuntar una captura de pantalla del pago — es obligatorio, no opcional. Los pagos se confirman de forma manual, no hay pasarela en tiempo real.
 
 CONTACTO PARA CASOS QUE NO PUEDAS RESOLVER: WhatsApp ${PaymentInfo.pagoMovilPhone}
 
