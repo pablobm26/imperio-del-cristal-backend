@@ -157,16 +157,39 @@ function rowsToProducts(rows, columnMap) {
   }).filter(Boolean);
 }
 
+// Cachea en memoria de proceso el contenido de un JSON (products/details/reviews/stock_adjustments)
+// — GET /api/products/:id releía los 4 archivos del disco en CADA llamada, y el build estático de
+// tienda_web le pega ~8700 veces seguidas durante un deploy; esa lectura sincrónica repetida era
+// carga real de más sobre un solo proceso Node, y varias veces terminó tumbando el backend a mitad
+// del build (ver server.js history). save() actualiza la caché con el mismo objeto que ya se está
+// escribiendo, así que nunca queda desincronizada con el archivo.
+function makeJsonStore(filePath) {
+  let cache = null;
+  return {
+    load() {
+      if (cache === null) cache = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      return cache;
+    },
+    save(data) {
+      cache = data;
+      fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+    },
+  };
+}
+
+const productsStore = makeJsonStore(PRODUCTS_FILE);
+const stockAdjustmentsStore = makeJsonStore(STOCK_ADJUSTMENTS_FILE);
+
 function loadProducts() {
-  return JSON.parse(fs.readFileSync(PRODUCTS_FILE, 'utf8'));
+  return productsStore.load();
 }
 
 function loadStockAdjustments() {
-  return JSON.parse(fs.readFileSync(STOCK_ADJUSTMENTS_FILE, 'utf8'));
+  return stockAdjustmentsStore.load();
 }
 
 function saveStockAdjustments(adjustments) {
-  fs.writeFileSync(STOCK_ADJUSTMENTS_FILE, JSON.stringify(adjustments, null, 2));
+  stockAdjustmentsStore.save(adjustments);
 }
 
 // Descuenta (delta negativo, una venta) o repone (delta positivo, una anulación desde
@@ -209,23 +232,26 @@ function replaceProductsCatalog(newProducts) {
     else delete adjustments[p.id];
   }
   saveStockAdjustments(adjustments);
-  fs.writeFileSync(PRODUCTS_FILE, JSON.stringify(newProducts, null, 2));
+  productsStore.save(newProducts);
 }
 
+const detailsStore = makeJsonStore(DETAILS_FILE);
+const reviewsStore = makeJsonStore(REVIEWS_FILE);
+
 function loadDetails() {
-  return JSON.parse(fs.readFileSync(DETAILS_FILE, 'utf8'));
+  return detailsStore.load();
 }
 
 function saveDetails(details) {
-  fs.writeFileSync(DETAILS_FILE, JSON.stringify(details, null, 2));
+  detailsStore.save(details);
 }
 
 function loadReviews() {
-  return JSON.parse(fs.readFileSync(REVIEWS_FILE, 'utf8'));
+  return reviewsStore.load();
 }
 
 function saveReviews(reviews) {
-  fs.writeFileSync(REVIEWS_FILE, JSON.stringify(reviews, null, 2));
+  reviewsStore.save(reviews);
 }
 
 function loadOrdersLocation() {
