@@ -950,11 +950,17 @@ app.get('/api/products', (req, res) => {
 });
 
 // Un solo producto por ID — evita que la página de cada producto tenga que descargar el
-// catálogo completo (varios MB) solo para mostrar uno.
+// catálogo completo (varios MB) solo para mostrar uno. Importante: NO usa getMergedProducts()
+// (fusiona los ~8700 productos completos en cada llamada) porque el build estático de
+// tienda_web pega a este endpoint una vez por producto (~8700 veces seguidas) — con el merge
+// completo cada request quedaba haciendo ~8700 spreads de objeto de más, y esa carga sostenida
+// terminó tumbando el backend (ECONNRESET) a mitad del build. Acá se busca el producto crudo
+// primero (barato) y solo se fusionan detalles/reviews para ese único producto.
 app.get('/api/products/:id', (req, res) => {
-  const product = getMergedProducts().find((p) => p.id === req.params.id);
-  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
-  res.json(product);
+  const raw = loadProducts().find((p) => p.id === req.params.id);
+  if (!raw) return res.status(404).json({ error: 'Producto no encontrado.' });
+  const merged = mergeProductWithDetails(raw, loadDetails());
+  res.json({ ...merged, ...ratingSummary(loadReviews()[raw.id]) });
 });
 
 app.get('/api/categories', (req, res) => {
