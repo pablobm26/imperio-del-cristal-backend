@@ -466,8 +466,12 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
     doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text('Código de verificación del pedido', { align: 'center' });
     doc.moveDown(0.2);
     // Cuadrado de 32mm — cómodo para escanear de cerca en el mostrador, bien adentro de los
-    // 72mm imprimibles (80mm de rollo - 4mm de margen a cada lado).
-    doc.image(barcodeBuffer, { fit: [mm(32), mm(32)], align: 'center' });
+    // 72mm imprimibles (80mm de rollo - 4mm de margen a cada lado). `align: 'center'` solo no
+    // centra bien combinado con `fit` (bug conocido de pdfkit) — se calcula la posición X a mano.
+    const qrSize = mm(32);
+    const qrX = doc.x + (RECEIPT_CONTENT_WIDTH - qrSize) / 2;
+    doc.image(barcodeBuffer, qrX, doc.y, { fit: [qrSize, qrSize] });
+    doc.y += qrSize;
     doc.moveDown(0.2);
     doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(order.orderId, { align: 'center' });
   }
