@@ -368,7 +368,10 @@ const RECEIPT_MAX_HEIGHT = mm(1000); // alto holgado solo para medir, se recorta
 function drawReceiptDivider(doc) {
   doc.moveDown(0.2);
   const y = doc.y;
-  doc.moveTo(doc.x, y).lineTo(doc.x + RECEIPT_CONTENT_WIDTH, y).lineWidth(0.5).strokeColor('#999').stroke();
+  // Negro puro (no gris) — una impresora térmica simula el gris con menos densidad de puntos, y
+  // sale rayado/débil en el papel real (se vio clarito en un recibo impreso y escaneado que trajo
+  // el dueño). Todo el recibo es monocromático en negro a propósito por lo mismo.
+  doc.moveTo(doc.x, y).lineTo(doc.x + RECEIPT_CONTENT_WIDTH, y).lineWidth(0.7).strokeColor('#000').stroke();
   doc.moveDown(0.4);
 }
 
@@ -377,15 +380,15 @@ function drawReceiptDivider(doc) {
 // generar el PDF final con esa altura exacta — así no se imprime papel en blanco de más.
 function drawReceiptBody(doc, order, barcodeBuffer) {
   doc.font('Helvetica-Bold').fontSize(13).fillColor('#000').text('El Imperio del Cristal', { align: 'center' });
-  doc.font('Helvetica').fontSize(8).fillColor('#555').text('Bisutería y accesorios', { align: 'center' });
+  doc.font('Helvetica-Bold').fontSize(9).fillColor('#000').text('Bisutería y accesorios', { align: 'center' });
   doc.moveDown(0.3);
-  doc.fontSize(7).fillColor('#999');
+  doc.font('Helvetica-Bold').fontSize(8).fillColor('#000');
   doc.text(`Pedido: ${order.orderId}`, { align: 'center' });
   doc.text(`Fecha: ${new Date(order.createdAt).toLocaleString('es-VE')}`, { align: 'center' });
   drawReceiptDivider(doc);
 
   doc.font('Helvetica-Bold').fontSize(9).fillColor('#000').text('Datos del cliente');
-  doc.font('Helvetica').fontSize(8);
+  doc.font('Helvetica-Bold').fontSize(8);
   doc.text(`Nombre: ${order.nombre}`);
   doc.text(`Identificación: ${order.idType}-${order.cedula}`);
   doc.text(`Teléfono: ${order.telefono}`);
@@ -393,7 +396,7 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   drawReceiptDivider(doc);
 
   doc.font('Helvetica-Bold').fontSize(9).text('Entrega');
-  doc.font('Helvetica').fontSize(8);
+  doc.font('Helvetica-Bold').fontSize(8);
   doc.text(`Estado: ${order.estado}`);
   doc.text(`Ciudad: ${order.ciudad}`);
   doc.text(`Parroquia: ${order.parroquia}`);
@@ -415,7 +418,7 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   drawReceiptDivider(doc);
 
   doc.font('Helvetica-Bold').fontSize(9).text('Pago');
-  doc.font('Helvetica').fontSize(8);
+  doc.font('Helvetica-Bold').fontSize(8);
   doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
   if (order.reference) doc.text(`Referencia: ${order.reference}`);
   if (order.paymentHolderName) doc.text(`Titular del pago: ${order.paymentHolderName}`);
@@ -428,9 +431,9 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   doc.font('Helvetica-Bold').fontSize(9).text('Productos');
   doc.moveDown(0.2);
   for (const item of order.items) {
-    doc.font('Helvetica').fontSize(7).fillColor('#666').text(item.id);
+    doc.font('Helvetica-Bold').fontSize(7).fillColor('#000').text(item.id);
     doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(item.title);
-    doc.font('Helvetica').fontSize(8);
+    doc.font('Helvetica-Bold').fontSize(8);
     doc.text(`${item.quantity} x ${formatUsd(item.price)} = ${formatUsd(item.price * item.quantity)}`);
     doc.moveDown(0.3);
   }
@@ -438,7 +441,7 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
 
   if (order.discountApplied) {
     const subtotal = order.total + order.discountApplied.amount - (order.deliveryFee || 0);
-    doc.font('Helvetica').fontSize(8).fillColor('#666').text(`Subtotal: ${formatUsd(subtotal)}`, { align: 'right' });
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(`Subtotal: ${formatUsd(subtotal)}`, { align: 'right' });
     doc.text(
       `Descuento nivel ${order.discountApplied.tier} (-${order.discountApplied.percent}%): -${formatUsd(order.discountApplied.amount)}`,
       { align: 'right' }
@@ -450,22 +453,23 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   // La moneda secundaria del total depende del país del pedido: Bs solo para Venezuela, COP solo
   // para Colombia, ninguna para EEUU (aunque el request traiga bcvRate/trmRate, el país manda).
   if (order.country === 'CO' && order.trmRate) {
-    doc.font('Helvetica').fontSize(8).fillColor('#666').text(`(${formatCop(order.total * order.trmRate)})`, { align: 'right' });
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(`(${formatCop(order.total * order.trmRate)})`, { align: 'right' });
   } else if (order.country !== 'US' && order.country !== 'CO' && order.bcvRate) {
-    doc.font('Helvetica').fontSize(8).fillColor('#666').text(`(${formatBs(order.total * order.bcvRate)})`, { align: 'right' });
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(`(${formatBs(order.total * order.bcvRate)})`, { align: 'right' });
   }
 
-  // Código de barras del número de pedido: permite escanear y validar en tienda que esta venta
-  // no se procese/entregue dos veces. No es un ID de pago externo, solo el orderId propio.
+  // Código QR del número de pedido: permite escanear y validar en tienda que esta venta no se
+  // procese/entregue dos veces (ver POST /api/admin/scan). No es un ID de pago externo, solo el
+  // orderId propio.
   if (barcodeBuffer) {
     doc.moveDown(0.8);
-    doc.fontSize(7).fillColor('#666').text('Código de verificación del pedido', { align: 'center' });
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text('Código de verificación del pedido', { align: 'center' });
     doc.moveDown(0.2);
-    // 68mm dentro de los 72mm imprimibles (80mm de rollo - 4mm de margen a cada lado) — lo más
-    // grande posible sin tocar el borde, para que el lector USB tenga el mayor margen de error.
-    doc.image(barcodeBuffer, { fit: [mm(68), mm(16)], align: 'center' });
+    // Cuadrado de 32mm — cómodo para escanear de cerca en el mostrador, bien adentro de los
+    // 72mm imprimibles (80mm de rollo - 4mm de margen a cada lado).
+    doc.image(barcodeBuffer, { fit: [mm(32), mm(32)], align: 'center' });
     doc.moveDown(0.2);
-    doc.font('Helvetica').fontSize(8).fillColor('#000').text(order.orderId, { align: 'center' });
+    doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(order.orderId, { align: 'center' });
   }
 }
 
@@ -479,14 +483,17 @@ async function generateOrderPdfBuffer(order) {
   let barcodeBuffer = null;
   try {
     barcodeBuffer = await bwipjs.toBuffer({
-      bcid: 'code128',
+      // QR en vez de Code 128: el dueño probó con un pedido real y la impresora térmica dejó
+      // rayas/zonas débiles en el papel (cabezal desgastado) — un código de barras lineal no
+      // tolera eso, una sola raya sobre una barra tira abajo la lectura completa. El QR tiene
+      // corrección de errores incorporada (nivel 'H' = hasta ~30% del código dañado/tapado y
+      // sigue leyendo bien), mucho más resistente a ese tipo de defecto real de impresión.
+      // Confirmado con el dueño que el lector USB es de cámara/imagen (2D), no láser de una sola
+      // línea — un lector láser viejo NO puede leer QR, por eso se preguntó antes de cambiar.
+      bcid: 'qrcode',
       text: order.orderId,
-      // scale más alto = más resolución en el bitmap fuente (no cambia el tamaño físico final,
-      // eso lo fija el `fit` en mm más abajo) — importante para que el lector USB lo descifre
-      // bien incluso con la calidad de impresión térmica. height más alto tolera mejor un barrido
-      // en ángulo con lectores tipo láser/CCD viejos.
+      eclevel: 'H',
       scale: 3,
-      height: 12,
       includetext: false,
     });
   } catch (err) {
@@ -526,14 +533,17 @@ async function generateReceiptWithProofPdfBuffer(order, proofBuffer) {
   let barcodeBuffer = null;
   try {
     barcodeBuffer = await bwipjs.toBuffer({
-      bcid: 'code128',
+      // QR en vez de Code 128: el dueño probó con un pedido real y la impresora térmica dejó
+      // rayas/zonas débiles en el papel (cabezal desgastado) — un código de barras lineal no
+      // tolera eso, una sola raya sobre una barra tira abajo la lectura completa. El QR tiene
+      // corrección de errores incorporada (nivel 'H' = hasta ~30% del código dañado/tapado y
+      // sigue leyendo bien), mucho más resistente a ese tipo de defecto real de impresión.
+      // Confirmado con el dueño que el lector USB es de cámara/imagen (2D), no láser de una sola
+      // línea — un lector láser viejo NO puede leer QR, por eso se preguntó antes de cambiar.
+      bcid: 'qrcode',
       text: order.orderId,
-      // scale más alto = más resolución en el bitmap fuente (no cambia el tamaño físico final,
-      // eso lo fija el `fit` en mm más abajo) — importante para que el lector USB lo descifre
-      // bien incluso con la calidad de impresión térmica. height más alto tolera mejor un barrido
-      // en ángulo con lectores tipo láser/CCD viejos.
+      eclevel: 'H',
       scale: 3,
-      height: 12,
       includetext: false,
     });
   } catch (err) {
