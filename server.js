@@ -49,6 +49,17 @@ const ORDERS_PDF_DIR = path.join(DATA_DIR, 'orders_pdfs');
 const ORDERS_PAYMENT_PROOFS_DIR = path.join(DATA_DIR, 'orders_payment_proofs');
 const ORDERS_RECEIPTS_DIR = path.join(DATA_DIR, 'orders_receipts');
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'changeme';
+// Panel nuevo (cristal44.com/admin) con usuario+contraseña en vez del password-suelto-por-formulario
+// que usan las pantallas HTML viejas (/admin, /admin/purchases, etc. — esas no se tocan). "admin"
+// reutiliza el mismo ADMIN_PASSWORD de siempre (un solo secreto que administrar); "salidas" es una
+// cuenta nueva y separada, pensada para la persona que solo escanea códigos a la salida — no tiene
+// acceso a nada más del panel (el backend se lo niega, no es solo un tema de UI).
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const SALIDAS_USERNAME = process.env.SALIDAS_USERNAME || 'salidas';
+const SALIDAS_PASSWORD = process.env.SALIDAS_PASSWORD || 'changeme';
+// Firma los tokens de sesión del panel nuevo (ver login/verifyAdminToken más abajo). Mismo patrón
+// de fallback "changeme" que ADMIN_PASSWORD — hay que fijarlo de verdad en el Environment de Render.
+const ADMIN_TOKEN_SECRET = process.env.ADMIN_TOKEN_SECRET || 'changeme-token-secret';
 // Secreto separado del ADMIN_PASSWORD para el cron externo que dispara el envío de recordatorios
 // de carrito (/cron/cart-reminders) — así ese secreto puede vivir en la URL configurada en un
 // servicio de cron de terceros sin exponer la contraseña real del panel de administración.
@@ -755,6 +766,110 @@ app.get('/', (req, res) => {
   res.redirect('/admin');
 });
 
+// --- Panel nuevo (cristal44.com/admin): login con usuario/contraseña + escaneo de salidas ---
+// Token stateless firmado con HMAC (sin sesiones en memoria ni tabla nueva en Supabase) — el
+// frontend lo guarda (localStorage) y lo manda en el header Authorization en cada request. Expira a
+// las 12 horas (una jornada de trabajo; si hace falta más, se vuelve a loguear). No usa cookies a
+// propósito: tienda_web (cristal44.com) y este backend (onrender.com) son dominios distintos, y un
+// bearer token evita todo el tema de cookies cross-origin.
+const ADMIN_TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
+
+function signAdminToken(role) {
+  const payload = Buffer.from(JSON.stringify({ role, exp: Date.now() + ADMIN_TOKEN_TTL_MS })).toString('base64url');
+  const signature = crypto.createHmac('sha256', ADMIN_TOKEN_SECRET).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function verifyAdminToken(token) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return null;
+  const [payload, signature] = token.split('.');
+  const expected = crypto.createHmac('sha256', ADMIN_TOKEN_SECRET).update(payload).digest('base64url');
+  if (
+    !signature ||
+    signature.length !== expected.length ||
+    !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))
+  ) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!data.exp || data.exp < Date.now()) return null;
+    return data; // { role, exp }
+  } catch {
+    return null;
+  }
+}
+
+// Exige un token válido con alguno de los roles permitidos — el chequeo es server-side, no un
+// simple ocultamiento de UI: "salidas" no puede pegarle a nada que no esté explícitamente permitido
+// acá, sin importar qué muestre o deje de mostrar el frontend.
+function requireAdminRole(...allowedRoles) {
+  return (req, res, next) => {
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    const data = verifyAdminToken(token);
+    if (!data || !allowedRoles.includes(data.role)) {
+      return res.status(401).json({ error: 'No autorizado.' });
+    }
+    req.adminRole = data.role;
+    next();
+  };
+}
+
+app.post('/api/admin/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
+    return res.json({ token: signAdminToken('admin'), role: 'admin' });
+  }
+  if (username === SALIDAS_USERNAME && password === SALIDAS_PASSWORD) {
+    return res.json({ token: signAdminToken('salidas'), role: 'salidas' });
+  }
+  res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+});
+
+function scanOrderSummary(order) {
+  return {
+    orderId: order.orderId,
+    createdAt: order.createdAt,
+    nombre: order.nombre || null,
+    telefono: order.telefono || null,
+    total: order.total ?? null,
+    paymentMethod: order.paymentMethod,
+    reference: order.reference || null,
+    paymentHolderName: order.paymentHolderName || null,
+    proofUrl: order.proofUrl || null,
+    items: order.items || [],
+    dispatchedAt: order.dispatchedAt || null,
+    dispatchedBy: order.dispatchedBy || null,
+  };
+}
+
+// Escanea el código de barras del recibo (codifica el orderId crudo, ver generateOrderPdfBuffer más
+// arriba) a la salida de la tienda: confirma los datos del pedido y lo marca como despachado — una
+// sola vez. Si ya se había escaneado antes, NO lo vuelve a marcar y avisa que ya se procesó, para
+// que la misma compra no pueda "salir" dos veces.
+app.post('/api/admin/scan', requireAdminRole('admin', 'salidas'), (req, res) => {
+  const code = String(req.body?.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'Falta el código escaneado.' });
+
+  const orders = loadOrdersLocation();
+  const order = orders.find((o) => o.orderId === code);
+  if (!order) {
+    return res.status(404).json({ error: 'No se encontró ningún pedido con ese código.' });
+  }
+  if (order.dispatchedAt) {
+    return res.status(409).json({
+      error: 'Esta compra ya está procesada y entregada/enviada, no se puede repetir.',
+      order: scanOrderSummary(order),
+    });
+  }
+
+  order.dispatchedAt = new Date().toISOString();
+  order.dispatchedBy = req.adminRole;
+  saveOrdersLocation(orders);
+  res.json({ ok: true, order: scanOrderSummary(order) });
+});
+
 app.get('/admin', (req, res) => {
   const products = loadProducts();
   res.send(`<!doctype html>
@@ -1289,6 +1404,14 @@ app.post('/api/orders', (req, res) => {
     // depender de una migración de esquema — mismo esquema de acceso que /pdf, /proof, /receipt
     // más abajo (el orderId al azar ES el token, ver GET /api/orders/:orderId/items).
     items: normalizedItems,
+    // nombre/telefono/total no hacían falta acá hasta ahora (ya vivían en el PDF y en
+    // customers.json) — se agregan para mostrarlos en la pantalla de escaneo de salidas
+    // (POST /api/admin/scan) sin tener que cruzar con otro archivo.
+    nombre,
+    telefono,
+    total: finalTotal,
+    dispatchedAt: null,
+    dispatchedBy: null,
     createdAt,
   });
   saveOrdersLocation(orders);
