@@ -37,6 +37,10 @@ app.use('/api', cors());
 // redeploys. Sin esa variable, cae de vuelta a la carpeta local del repo (efímera en Render free).
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PRODUCTS_FILE = path.join(DATA_DIR, 'products.json');
+// Ventas hechas en la web que todavía no se reflejan en el stock de PLADE (PLADE recién descuenta
+// cuando el dueño procesa/confirma el pago a mano ahí, no cuando llega el pedido) — ver
+// replaceProductsCatalog() y getMergedProducts() más abajo para el porqué de esta capa aparte.
+const STOCK_ADJUSTMENTS_FILE = path.join(DATA_DIR, 'stock_adjustments.json');
 const DETAILS_FILE = path.join(DATA_DIR, 'product_details.json');
 const REVIEWS_FILE = path.join(DATA_DIR, 'reviews.json');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders_location.json');
@@ -52,6 +56,7 @@ const CRON_SECRET = process.env.CRON_SECRET;
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(PRODUCTS_FILE)) fs.writeFileSync(PRODUCTS_FILE, '[]');
+if (!fs.existsSync(STOCK_ADJUSTMENTS_FILE)) fs.writeFileSync(STOCK_ADJUSTMENTS_FILE, '{}');
 if (!fs.existsSync(DETAILS_FILE)) fs.writeFileSync(DETAILS_FILE, '{}');
 if (!fs.existsSync(REVIEWS_FILE)) fs.writeFileSync(REVIEWS_FILE, '{}');
 if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
@@ -143,6 +148,57 @@ function rowsToProducts(rows, columnMap) {
 
 function loadProducts() {
   return JSON.parse(fs.readFileSync(PRODUCTS_FILE, 'utf8'));
+}
+
+function loadStockAdjustments() {
+  return JSON.parse(fs.readFileSync(STOCK_ADJUSTMENTS_FILE, 'utf8'));
+}
+
+function saveStockAdjustments(adjustments) {
+  fs.writeFileSync(STOCK_ADJUSTMENTS_FILE, JSON.stringify(adjustments, null, 2));
+}
+
+// Descuenta (delta negativo, una venta) o repone (delta positivo, una anulación desde
+// /admin/purchases) stock — pero SIN tocar PRODUCTS_FILE. PLADE recién descuenta su propio stock
+// cuando el dueño procesa/confirma el pago a mano ahí (no cuando llega el pedido automático), así
+// que si tocáramos PRODUCTS_FILE directo, la sincronización de los 30 min lo pisaría de vuelta al
+// número viejo antes de que PLADE se entere de la venta — literalmente deshaciendo el descuento.
+// En cambio, esto se acumula en stock_adjustments.json (una capa aparte que se resta en
+// getMergedProducts()) y se va reconciliando sola en replaceProductsCatalog() más abajo, a medida
+// que el stock de PLADE realmente baja. No deja que lo pendiente baje de 0.
+function adjustStock(items, delta) {
+  const adjustments = loadStockAdjustments();
+  for (const item of items) {
+    const pending = Math.max(0, (adjustments[item.id] || 0) - delta * item.quantity);
+    if (pending > 0) adjustments[item.id] = pending;
+    else delete adjustments[item.id];
+  }
+  saveStockAdjustments(adjustments);
+}
+
+// Reemplaza el catálogo crudo (sincronización con PLADE o carga manual de Excel/CSV en
+// /admin/upload) y reconcilia stock_adjustments.json de paso: por cada producto cuyo stock bajó
+// respecto a la versión anterior, ese tanto ya lo procesó PLADE (sea nuestra venta online o una
+// venta en tienda física — no hay forma de distinguir cuál, pero no importa: cualquier baja real
+// cuenta como "ya lo tiene en cuenta PLADE") — se le resta esa baja a lo pendiente, para no
+// descontarlo dos veces. Si el stock sube (reposición) o queda igual, lo pendiente no se toca:
+// sigue esperando a que PLADE procese esa venta puntual.
+function replaceProductsCatalog(newProducts) {
+  const oldById = new Map(loadProducts().map((p) => [p.id, p]));
+  const adjustments = loadStockAdjustments();
+  for (const p of newProducts) {
+    const pending = adjustments[p.id];
+    if (!pending) continue;
+    const old = oldById.get(p.id);
+    if (!old || old.stock === null || p.stock === null) continue;
+    const drop = Math.max(0, old.stock - p.stock);
+    if (drop <= 0) continue;
+    const remaining = Math.max(0, pending - drop);
+    if (remaining > 0) adjustments[p.id] = remaining;
+    else delete adjustments[p.id];
+  }
+  saveStockAdjustments(adjustments);
+  fs.writeFileSync(PRODUCTS_FILE, JSON.stringify(newProducts, null, 2));
 }
 
 function loadDetails() {
@@ -492,13 +548,27 @@ function mergeProductWithDetails(product, details) {
   return merged;
 }
 
+// Resta lo pendiente de stock_adjustments.json (ventas online que PLADE todavía no procesó) sobre
+// el stock crudo — ver adjustStock()/replaceProductsCatalog() más arriba. No toca stock null (no
+// rastreado).
+function applyPendingStock(stock, productId, adjustments) {
+  const pending = adjustments[productId];
+  if (!pending || stock === null || stock === undefined) return stock;
+  return Math.max(0, stock - pending);
+}
+
 function getMergedProducts() {
   const products = loadProducts();
   const details = loadDetails();
   const reviews = loadReviews();
+  const adjustments = loadStockAdjustments();
   return products.map((p) => {
     const merged = mergeProductWithDetails(p, details);
-    return { ...merged, ...ratingSummary(reviews[p.id]) };
+    return {
+      ...merged,
+      stock: applyPendingStock(merged.stock, p.id, adjustments),
+      ...ratingSummary(reviews[p.id]),
+    };
   });
 }
 
@@ -514,7 +584,7 @@ let lastPladeSync = null; // { at: string, count: number } | { at: string, error
 async function syncProductsFromPlade() {
   const items = await getInventario();
   const products = items.map(mapPladeItemToProduct).filter((p) => p.id && p.title);
-  fs.writeFileSync(PRODUCTS_FILE, JSON.stringify(products, null, 2));
+  replaceProductsCatalog(products);
   lastPladeSync = { at: new Date().toISOString(), count: products.length };
   console.log(`Sincronizado con PLADE: ${products.length} productos (${lastPladeSync.at})`);
   return products.length;
@@ -786,7 +856,7 @@ app.post('/admin/upload', upload.single('file'), (req, res) => {
     }
 
     const products = rowsToProducts(rows, columnMap);
-    fs.writeFileSync(PRODUCTS_FILE, JSON.stringify(products, null, 2));
+    replaceProductsCatalog(products);
 
     res.send(`Inventario actualizado: ${products.length} productos cargados. <a href="/admin">Volver</a>`);
   } catch (err) {
@@ -992,7 +1062,8 @@ app.get('/api/products/:id', (req, res) => {
   const raw = loadProducts().find((p) => p.id === req.params.id);
   if (!raw) return res.status(404).json({ error: 'Producto no encontrado.' });
   const merged = mergeProductWithDetails(raw, loadDetails());
-  res.json({ ...merged, ...ratingSummary(loadReviews()[raw.id]) });
+  const stock = applyPendingStock(merged.stock, raw.id, loadStockAdjustments());
+  res.json({ ...merged, stock, ...ratingSummary(loadReviews()[raw.id]) });
 });
 
 app.get('/api/categories', (req, res) => {
@@ -1221,6 +1292,10 @@ app.post('/api/orders', (req, res) => {
     createdAt,
   });
   saveOrdersLocation(orders);
+  // Se descuenta para todo pedido que se completa (invitado o no, cualquier método de pago) —
+  // mismo momento en el que ya se crea la factura real en PLADE más abajo. Si el dueño anula el
+  // pedido después, se repone en POST /admin/purchases/:id (solo pedidos con userId llegan ahí).
+  adjustStock(normalizedItems, -1);
 
   const customers = loadCustomers();
   const key = `${idType}-${cedula}`;
@@ -1462,7 +1537,17 @@ app.post('/admin/purchases/:id', async (req, res) => {
   }
   const status = req.body?.status === 'confirmed' ? 'confirmed' : 'cancelled';
   try {
+    const purchase = await getPurchase(req.params.id);
     await setPurchaseStatus(req.params.id, status);
+    // Anular repone el stock que se había descontado; restaurar una compra anulada lo vuelve a
+    // descontar. Solo si el estado realmente cambia (evita reponer/descontar dos veces si alguien
+    // reenvía el formulario con el mismo estado que ya tenía).
+    if (purchase && purchase.status !== status) {
+      const order = loadOrdersLocation().find((o) => o.orderId === purchase.order_id);
+      if (order?.items?.length) {
+        adjustStock(order.items, status === 'cancelled' ? 1 : -1);
+      }
+    }
     res.redirect('/admin/purchases');
   } catch (err) {
     res.status(500).send(`Error actualizando la compra: ${escapeHtml(err.message)}. <a href="/admin/purchases">Volver</a>`);
