@@ -461,7 +461,9 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
     doc.moveDown(0.8);
     doc.fontSize(7).fillColor('#666').text('Código de verificación del pedido', { align: 'center' });
     doc.moveDown(0.2);
-    doc.image(barcodeBuffer, { fit: [mm(60), mm(14)], align: 'center' });
+    // 68mm dentro de los 72mm imprimibles (80mm de rollo - 4mm de margen a cada lado) — lo más
+    // grande posible sin tocar el borde, para que el lector USB tenga el mayor margen de error.
+    doc.image(barcodeBuffer, { fit: [mm(68), mm(16)], align: 'center' });
     doc.moveDown(0.2);
     doc.font('Helvetica').fontSize(8).fillColor('#000').text(order.orderId, { align: 'center' });
   }
@@ -479,8 +481,12 @@ async function generateOrderPdfBuffer(order) {
     barcodeBuffer = await bwipjs.toBuffer({
       bcid: 'code128',
       text: order.orderId,
-      scale: 2,
-      height: 10,
+      // scale más alto = más resolución en el bitmap fuente (no cambia el tamaño físico final,
+      // eso lo fija el `fit` en mm más abajo) — importante para que el lector USB lo descifre
+      // bien incluso con la calidad de impresión térmica. height más alto tolera mejor un barrido
+      // en ángulo con lectores tipo láser/CCD viejos.
+      scale: 3,
+      height: 12,
       includetext: false,
     });
   } catch (err) {
@@ -522,8 +528,12 @@ async function generateReceiptWithProofPdfBuffer(order, proofBuffer) {
     barcodeBuffer = await bwipjs.toBuffer({
       bcid: 'code128',
       text: order.orderId,
-      scale: 2,
-      height: 10,
+      // scale más alto = más resolución en el bitmap fuente (no cambia el tamaño físico final,
+      // eso lo fija el `fit` en mm más abajo) — importante para que el lector USB lo descifre
+      // bien incluso con la calidad de impresión térmica. height más alto tolera mejor un barrido
+      // en ángulo con lectores tipo láser/CCD viejos.
+      scale: 3,
+      height: 12,
       includetext: false,
     });
   } catch (err) {
