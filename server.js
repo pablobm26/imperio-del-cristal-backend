@@ -960,12 +960,19 @@ app.get('/api/products/batch', (req, res) => {
 });
 
 // Muestra aleatoria de productos con imagen y stock — usado por tienda_web para sugerir productos
-// ("Quizás pueda interesarte") en el checkout, excluyendo lo que el cliente ya tiene en el carrito
-// o ya vio. También tiene que ir ANTES de /api/products/:id.
+// ("Quizás pueda interesarte") en el carrito/checkout, excluyendo lo que el cliente ya tiene en el
+// carrito o ya vio. Con `maxStock` filtra a solo productos con poco stock (0 < stock < maxStock),
+// para el rail de "Últimas unidades" — sin este parámetro, cualquier producto con stock cuenta.
+// También tiene que ir ANTES de /api/products/:id.
 app.get('/api/products/random', (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 20);
   const exclude = new Set(String(req.query.exclude || '').split(',').map((s) => s.trim()).filter(Boolean));
-  const pool = getMergedProducts().filter((p) => !exclude.has(p.id) && p.image && (p.stock === null || p.stock > 0));
+  const maxStock = req.query.maxStock ? Math.max(1, parseInt(req.query.maxStock, 10) || 0) : null;
+  const pool = getMergedProducts().filter((p) => {
+    if (exclude.has(p.id) || !p.image) return false;
+    if (maxStock !== null) return p.stock !== null && p.stock > 0 && p.stock < maxStock;
+    return p.stock === null || p.stock > 0;
+  });
   const picked = [];
   while (picked.length < limit && pool.length > 0) {
     const i = Math.floor(Math.random() * pool.length);
