@@ -949,6 +949,31 @@ app.get('/api/products', (req, res) => {
   res.json(getMergedProducts());
 });
 
+// Lote de productos por ID (ej. "Últimos productos visitados" en tienda_web) — un solo request en
+// vez de una llamada por producto. Tiene que ir ANTES de /api/products/:id para que Express no
+// interprete "batch" como un id.
+app.get('/api/products/batch', (req, res) => {
+  const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 20);
+  if (ids.length === 0) return res.json([]);
+  const idSet = new Set(ids);
+  res.json(getMergedProducts().filter((p) => idSet.has(p.id)));
+});
+
+// Muestra aleatoria de productos con imagen y stock — usado por tienda_web para sugerir productos
+// ("Quizás pueda interesarte") en el checkout, excluyendo lo que el cliente ya tiene en el carrito
+// o ya vio. También tiene que ir ANTES de /api/products/:id.
+app.get('/api/products/random', (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 20);
+  const exclude = new Set(String(req.query.exclude || '').split(',').map((s) => s.trim()).filter(Boolean));
+  const pool = getMergedProducts().filter((p) => !exclude.has(p.id) && p.image && (p.stock === null || p.stock > 0));
+  const picked = [];
+  while (picked.length < limit && pool.length > 0) {
+    const i = Math.floor(Math.random() * pool.length);
+    picked.push(pool.splice(i, 1)[0]);
+  }
+  res.json(picked);
+});
+
 // Un solo producto por ID — evita que la página de cada producto tenga que descargar el
 // catálogo completo (varios MB) solo para mostrar uno. Importante: NO usa getMergedProducts()
 // (fusiona los ~8700 productos completos en cada llamada) porque el build estático de
@@ -1182,6 +1207,10 @@ app.post('/api/orders', (req, res) => {
     pdfUrl,
     proofUrl,
     receiptUrl,
+    // Se guarda acá (no en Supabase) para poder ofrecer "Repetir compra" desde el historial sin
+    // depender de una migración de esquema — mismo esquema de acceso que /pdf, /proof, /receipt
+    // más abajo (el orderId al azar ES el token, ver GET /api/orders/:orderId/items).
+    items: normalizedItems,
     createdAt,
   });
   saveOrdersLocation(orders);
@@ -1270,6 +1299,21 @@ app.get('/api/orders/:orderId/receipt', (req, res) => {
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="comprobante-${req.params.orderId.slice(0, 8)}.pdf"`);
   fs.createReadStream(filePath).pipe(res);
+});
+
+// Productos comprados en un pedido puntual — usado por "Repetir compra" en el historial de
+// tienda_web. Mismo esquema de acceso que /pdf, /proof, /receipt (el orderId al azar es el token).
+// Pedidos de antes de que se guardara `items` (ver arriba) devuelven items: [] — el frontend no
+// muestra el botón de repetir compra en ese caso.
+app.get('/api/orders/:orderId/items', (req, res) => {
+  if (!/^[a-f0-9]{32}$/.test(req.params.orderId)) {
+    return res.status(400).json({ error: 'ID de pedido inválido.' });
+  }
+  const order = loadOrdersLocation().find((o) => o.orderId === req.params.orderId);
+  if (!order) {
+    return res.status(404).json({ error: 'Pedido no encontrado.' });
+  }
+  res.json({ items: order.items || [] });
 });
 
 // Reportes crudos para el dueño (sin UI todavía) — protegidos con ADMIN_PASSWORD por venir con datos

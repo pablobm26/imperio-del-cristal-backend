@@ -151,7 +151,7 @@ MÉTODOS DE PAGO ACEPTADOS (ya no se acepta tarjeta, se sacó del checkout):
 - Efectivo contra entrega (único método sin captura de pago)
 - Zinli: ${PaymentInfo.zinliEmail}
 - Zelle: ${PaymentInfo.zelleEmail} (titular: ${PaymentInfo.zelleHolder})
-- Binance Pay ID (USDT): ${PaymentInfo.binancePayId}
+- Binance Pay ID (USDT): ${PaymentInfo.binancePayId} (también se puede enviar al correo ${PaymentInfo.binancePayEmail})
 - Pago Móvil: Teléfono ${PaymentInfo.pagoMovilPhone}, Cédula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}
 
 Para todos los métodos excepto efectivo, el checkout le va a pedir al cliente adjuntar una captura de pantalla del pago — es obligatorio, no opcional. Los pagos se confirman de forma manual, no hay pasarela en tiempo real.
