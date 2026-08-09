@@ -10,6 +10,7 @@ const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade } = require('./plade-marketplade-client');
+const adminUsers = require('./admin-users');
 const {
   isLoyaltyConfigured,
   getLoyaltyForUser,
@@ -873,8 +874,17 @@ app.get('/', (req, res) => {
 // bearer token evita todo el tema de cookies cross-origin.
 const ADMIN_TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
 
-function signAdminToken(role) {
-  const payload = Buffer.from(JSON.stringify({ role, exp: Date.now() + ADMIN_TOKEN_TTL_MS })).toString('base64url');
+// `actor` identifica QUIÉN hizo la acción, para auditoría: { sub, username }. `sub` es el uuid de
+// la fila en admin_users, o null cuando el login vino por el respaldo de variables de entorno.
+function signAdminToken(role, actor = {}) {
+  const payload = Buffer.from(
+    JSON.stringify({
+      role,
+      sub: actor.sub || null,
+      username: actor.username || role,
+      exp: Date.now() + ADMIN_TOKEN_TTL_MS,
+    })
+  ).toString('base64url');
   const signature = crypto.createHmac('sha256', ADMIN_TOKEN_SECRET).update(payload).digest('base64url');
   return `${payload}.${signature}`;
 }
@@ -893,7 +903,7 @@ function verifyAdminToken(token) {
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     if (!data.exp || data.exp < Date.now()) return null;
-    return data; // { role, exp }
+    return data; // { role, sub, username, exp }
   } catch {
     return null;
   }
@@ -911,19 +921,128 @@ function requireAdminRole(...allowedRoles) {
       return res.status(401).json({ error: 'No autorizado.' });
     }
     req.adminRole = data.role;
+    req.adminUser = { sub: data.sub || null, username: data.username || data.role };
     next();
   };
 }
 
-app.post('/api/admin/login', (req, res) => {
-  const { username, password } = req.body || {};
+/**
+ * Valida usuario+contraseña en dos etapas, en este orden:
+ *
+ * 1. Contra la tabla `admin_users` de Supabase (una fila por persona, contraseña con bcrypt).
+ * 2. Si ese usuario NO existe ahí, contra las variables de entorno de siempre
+ *    (ADMIN_USERNAME/ADMIN_PASSWORD y SALIDAS_USERNAME/SALIDAS_PASSWORD).
+ *
+ * El orden importa: si el usuario existe en la tabla pero la contraseña está mal, se rechaza y NO
+ * se cae al respaldo — si no, alguien podría entrar como una cuenta real usando las credenciales
+ * compartidas. El respaldo existe solo para nombres de usuario que no están en la tabla.
+ *
+ * Por qué se mantiene el respaldo: es la vía de entrada cuando Supabase está caído, cuando la
+ * tabla todavía no se creó, o cuando alguien desactivó por error al último administrador. Sin él,
+ * un problema en la base te deja afuera de tu propio panel sin forma de arreglarlo.
+ */
+async function authenticateAdmin(username, password) {
+  const user = await adminUsers.findActiveUser(username);
+  if (user) {
+    const ok = await adminUsers.verifyPassword(password, user.password_hash);
+    if (!ok) return null;
+    adminUsers.touchLastLogin(user.id).catch((err) =>
+      console.error('No se pudo actualizar last_login_at:', err.message)
+    );
+    return { role: user.role, sub: user.id, username: user.username, fullName: user.full_name };
+  }
+
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-    return res.json({ token: signAdminToken('admin'), role: 'admin' });
+    return { role: 'admin', sub: null, username: ADMIN_USERNAME, fullName: 'Administrador' };
   }
   if (username === SALIDAS_USERNAME && password === SALIDAS_PASSWORD) {
-    return res.json({ token: signAdminToken('salidas'), role: 'salidas' });
+    return { role: 'salidas', sub: null, username: SALIDAS_USERNAME, fullName: 'Salidas' };
   }
-  res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+  return null;
+}
+
+app.post('/api/admin/login', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Falta usuario o contraseña.' });
+  }
+
+  let account;
+  try {
+    account = await authenticateAdmin(username, password);
+  } catch (err) {
+    // Supabase caído o mal configurado: se avisa en el log, pero al usuario se le da el mismo
+    // mensaje genérico que a una credencial inválida, para no filtrar el estado de la infra.
+    console.error('Error validando el login del panel:', err.message);
+    return res.status(500).json({ error: 'No se pudo validar el acceso. Intentá de nuevo.' });
+  }
+
+  if (!account) return res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+
+  res.json({
+    token: signAdminToken(account.role, { sub: account.sub, username: account.username }),
+    role: account.role,
+    username: account.username,
+    fullName: account.fullName,
+  });
+});
+
+// --- Gestión de usuarios del panel (solo rol admin) ---
+
+app.get('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
+  if (!adminUsers.isAdminUsersConfigured()) {
+    return res.status(503).json({ error: 'Supabase no está configurado: no hay tabla de usuarios todavía.' });
+  }
+  try {
+    res.json({ users: await adminUsers.listUsers() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
+  if (!adminUsers.isAdminUsersConfigured()) {
+    return res.status(503).json({ error: 'Supabase no está configurado: no hay tabla de usuarios todavía.' });
+  }
+  const { username, fullName, password, role } = req.body || {};
+  try {
+    res.status(201).json({ user: await adminUsers.createUser({ username, fullName, password, role }) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) => {
+  if (!adminUsers.isAdminUsersConfigured()) {
+    return res.status(503).json({ error: 'Supabase no está configurado: no hay tabla de usuarios todavía.' });
+  }
+  const { role, active, password } = req.body || {};
+
+  // Nadie puede desactivarse ni degradarse a sí mismo: es la forma más fácil de quedarse afuera
+  // del panel sin querer. Que lo haga otro administrador.
+  if (req.adminUser.sub && req.adminUser.sub === req.params.id && (active === false || (role && role !== 'admin'))) {
+    return res.status(400).json({ error: 'No podés desactivar ni cambiarle el rol a tu propia cuenta.' });
+  }
+
+  try {
+    // Guarda contra quedarse sin ningún administrador activo. Se chequea antes de escribir.
+    if (active === false || (role && role !== 'admin')) {
+      const target = (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
+      if (target && target.role === 'admin' && target.active && (await adminUsers.countActiveAdmins()) <= 1) {
+        return res.status(400).json({ error: 'Es el último administrador activo. Creá otro antes de tocar esta cuenta.' });
+      }
+    }
+
+    if (password !== undefined) await adminUsers.resetPassword(req.params.id, password);
+    const user =
+      role !== undefined || active !== undefined
+        ? await adminUsers.updateUser(req.params.id, { role, active })
+        : (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
+
+    res.json({ user });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 function scanOrderSummary(order) {
@@ -964,7 +1083,10 @@ app.post('/api/admin/scan', requireAdminRole('admin', 'salidas'), (req, res) => 
   }
 
   order.dispatchedAt = new Date().toISOString();
-  order.dispatchedBy = req.adminRole;
+  // Antes guardaba solo el rol ("admin"/"salidas"), que con cuentas compartidas era todo lo que se
+  // podía saber. Ahora guarda el usuario real; el rol queda como respaldo para los logins por
+  // variable de entorno, donde no hay una persona identificada.
+  order.dispatchedBy = req.adminUser.username || req.adminRole;
   saveOrdersLocation(orders);
   res.json({ ok: true, order: scanOrderSummary(order) });
 });

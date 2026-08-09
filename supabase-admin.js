@@ -88,6 +88,10 @@ async function setPurchaseStatus(id, status) {
 }
 
 module.exports = {
+  // Se exporta el cliente para que admin-users.js reuse esta misma instancia en vez de crear otra
+  // con las mismas credenciales. Es null si faltan las env vars — quien lo use tiene que chequear
+  // isLoyaltyConfigured() antes (o su propio wrapper, como isAdminUsersConfigured()).
+  supabaseAdmin,
   isLoyaltyConfigured,
   getLoyaltyForUser,
   recordPurchase,
