@@ -99,12 +99,26 @@ async function getFactura(factura) {
 // - productos[x][nom_mv] eliminado — solo se manda nom_inv.
 //
 // Valores confirmados contra la cuenta real (no adivinar, ver project_plade_integration.md):
-// - idc: 381 → "CLIENTE DEL E-COMMERCE". El campo idc que mandamos (antes 29869) NUNCA lo respeta
-//   savePedidoExterno — la orden siempre cae en el cliente 381 sin importar qué se envíe. Antes del
-//   2026-07-18 esa cuenta 381 era "CARLOS CASTELLANOS" (cuenta interna de PLADE, mal atribuida);
-//   PLADE actualizó esa misma cuenta para que ahora sea "CLIENTE DEL E-COMMERCE" (confirmado con
-//   getFactura en la factura 85817). Como el valor de idc no se respeta de todas formas, se manda
-//   381 directamente para que quede claro en el código qué cliente realmente se usa.
+// - idc: el campo que mandamos acá NUNCA lo respetó savePedidoExterno. Se probó con 29869, con 381,
+//   sin el campo y en distintos órdenes (≈23 facturas reales el 17-18/07/2026): la orden siempre
+//   cayó en el cliente 381, porque PLADE lo resuelve del usuario de la API (id_usuario 1500,
+//   "PLADE ALIANZAS") y no del cuerpo del pedido. Antes del 2026-07-18 la cuenta 381 era
+//   "CARLOS CASTELLANOS" (cuenta interna de PLADE, mal atribuida); cuando se les reportó, PLADE NO
+//   arregló la API — editaron el registro 381 para renombrarlo "CLIENTE DEL E-COMMERCE"
+//   (confirmado con getFactura en la factura 85817).
+//   2026-08-09: el dueño creó un cliente nuevo, id 2509 (RIF sin la J), y pidió que las ventas web
+//   queden bajo ese. Se cambió el valor enviado a 2509 y se PROBÓ con una factura real (88408):
+//   `getFactura` devolvió `id_cliente: "381"`, `idc: "381"`, `nom_cli: "CLIENTE DEL E-COMMERCE"` y
+//   `cod_cli: "21024060"` (= el usuario de la API). O sea que **sigue ignorándose**, igual que en
+//   julio — no cambió nada del lado de PLADE en estas 3 semanas. No dio error 500 y la línea de
+//   producto guardó bien, así que mandar 2509 es inofensivo: se deja como declaración de intención,
+//   listo para cuando PLADE lo respete.
+//   Para que las ventas caigan de verdad en 2509 hace falta que soporte de PLADE re-apunte el
+//   usuario de la API (id_usuario 1500, "PLADE ALIANZAS") a esa ficha — que es exactamente lo que
+//   hicieron en julio, cuando en vez de arreglar el campo editaron el registro 381. Pedido
+//   redactado en PEDIDO-SOPORTE-PLADE.md (raíz del repo).
+//   Cómo re-verificar después de que contesten: crear una venta real y leerla con getFactura; si
+//   `fac.id_cliente` vuelve 2509, quedó. No hace falta tocar código.
 // - id_almacen: 1 → "ALMACEN PRINCIPAL". Igual que idc, savePedidoExterno ignora lo que se envíe acá
 //   (se probó con 9 "ONLINE" y sin enviarlo, mismo resultado siempre) — se deja en 1 explícito por
 //   la misma razón que idc.
@@ -112,7 +126,7 @@ async function getFactura(factura) {
 //   tráfico de red del propio panel de PLADE.
 // - id_iva: 5 = "IVA 16%" (dato dado por el dueño 2026-07-18, confirmado contra factura real 85815).
 
-const GENERIC_CLIENT_IDC = process.env.PLADE_GENERIC_CLIENT_IDC || '381';
+const GENERIC_CLIENT_IDC = process.env.PLADE_GENERIC_CLIENT_IDC || '2509';
 const ONLINE_ALMACEN_ID = process.env.PLADE_ONLINE_ALMACEN_ID || '1';
 const ID_IVA_EXENTO = 4;
 const ID_IVA_16 = 5;
