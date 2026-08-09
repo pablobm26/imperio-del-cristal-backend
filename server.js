@@ -1279,11 +1279,7 @@ function puedeVerContador(req) {
   return req.adminRole === 'master' || req.adminUser.canViewCounter === true;
 }
 
-app.get('/api/admin/counter', requireAdminRole('master', 'admin'), (req, res) => {
-  if (!puedeVerContador(req)) {
-    return res.status(403).json({ error: 'Tu cuenta no tiene autorizado ver el contador de ventas.' });
-  }
-
+function calcularContador() {
   const desde = startOfTodayVenezuela();
   const orders = loadOrdersLocation();
 
@@ -1301,7 +1297,7 @@ app.get('/api/admin/counter', requireAdminRole('master', 'admin'), (req, res) =>
   const usd = deHoy.reduce((s, o) => s + (typeof o.total === 'number' ? o.total : 0), 0);
   const rate = bcvRateCache && bcvRateCache.rate ? bcvRateCache.rate : null;
 
-  res.json({
+  return {
     ventas: deHoy.length,
     despachados: despachadosHoy.length,
     usd,
@@ -1311,6 +1307,82 @@ app.get('/api/admin/counter', requireAdminRole('master', 'admin'), (req, res) =>
     // Para que el frontend sepa cuándo se reinicia sin recalcular la zona horaria por su cuenta.
     desde: new Date(desde).toISOString(),
     sinMonto: deHoy.filter((o) => typeof o.total !== 'number').length,
+  };
+}
+
+app.get('/api/admin/counter', requireAdminRole('master', 'admin'), (req, res) => {
+  if (!puedeVerContador(req)) {
+    return res.status(403).json({ error: 'Tu cuenta no tiene autorizado ver el contador de ventas.' });
+  }
+  res.json(calcularContador());
+});
+
+// --- Contador en tiempo real (Server-Sent Events) ---
+//
+// El contador se actualiza en el instante en que se crea una venta o se despacha un pedido, en vez
+// de esperar a que el navegador vuelva a preguntar. Se eligió SSE y no WebSockets porque el flujo
+// es de una sola dirección (servidor → panel): no hace falta una librería extra ni otro protocolo.
+//
+// El token NO viaja en la URL: el navegador se conecta con fetch + Authorization en vez de
+// EventSource (que no admite cabeceras). Un token de 12 horas en la query string quedaría escrito
+// en los logs de acceso de Render y de cualquier proxy intermedio.
+
+const clientesContador = new Set();
+/** Los proxies cortan conexiones ociosas; un comentario cada tanto las mantiene vivas. */
+const SSE_HEARTBEAT_MS = 25_000;
+
+function enviarEvento(res, data) {
+  try {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch {
+    // Cliente que se fue justo en el medio: lo limpia el handler de 'close'.
+  }
+}
+
+/**
+ * Empuja el contador a todos los paneles conectados. Se llama tras cada cambio que lo afecta.
+ * Nunca debe romper la operación que la invoca — por eso no lanza.
+ */
+function broadcastContador() {
+  if (clientesContador.size === 0) return;
+  let snapshot;
+  try {
+    snapshot = calcularContador();
+  } catch (err) {
+    console.error('No se pudo calcular el contador para emitir:', err.message);
+    return;
+  }
+  for (const res of clientesContador) enviarEvento(res, snapshot);
+}
+
+app.get('/api/admin/counter/stream', requireAdminRole('master', 'admin'), (req, res) => {
+  if (!puedeVerContador(req)) {
+    return res.status(403).json({ error: 'Tu cuenta no tiene autorizado ver el contador de ventas.' });
+  }
+
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    // Nginx (y el proxy de Render) bufferean por defecto y el stream no llegaría hasta cerrarse.
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+
+  clientesContador.add(res);
+  enviarEvento(res, calcularContador()); // foto inicial, para no esperar al primer cambio
+
+  const latido = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+    } catch {
+      /* ver 'close' */
+    }
+  }, SSE_HEARTBEAT_MS);
+
+  req.on('close', () => {
+    clearInterval(latido);
+    clientesContador.delete(res);
   });
 });
 
@@ -1512,6 +1584,7 @@ app.post('/api/admin/orders/:orderId/dispatch', requireAdminRole('admin', 'emple
   order.dispatchedAt = new Date().toISOString();
   order.dispatchedBy = req.adminUser.username || req.adminRole;
   saveOrdersLocation(orders);
+  broadcastContador();
   res.json({ ok: true, order: orderSummary(order) });
 });
 
@@ -1539,6 +1612,7 @@ app.post('/api/admin/orders/:orderId/cancel', requireAdminRole('admin'), async (
       adjustStock(order.items, restore ? -1 : 1);
     }
     saveOrdersLocation(orders);
+    broadcastContador();
 
     // Si el pedido tiene una compra registrada para fidelidad, se sincroniza el estado. Que no
     // exista es normal (compra de invitado) y no debe hacer fallar la anulación.
@@ -1777,6 +1851,7 @@ app.post('/api/admin/scan', requireAdminRole('admin', 'salidas'), (req, res) => 
   // variable de entorno, donde no hay una persona identificada.
   order.dispatchedBy = req.adminUser.username || req.adminRole;
   saveOrdersLocation(orders);
+  broadcastContador();
   res.json({ ok: true, order: scanOrderSummary(order) });
 });
 
@@ -2532,6 +2607,10 @@ app.post('/api/orders', (req, res) => {
     createdAt,
   });
   saveOrdersLocation(orders);
+  // El panel se entera de la venta en el instante en que el cliente termina de comprar, sin esperar
+  // a que el navegador vuelva a preguntar. Va después de guardar para que la foto que se emite ya
+  // incluya este pedido.
+  broadcastContador();
   // Se descuenta para todo pedido que se completa (invitado o no, cualquier método de pago) —
   // mismo momento en el que ya se crea la factura real en PLADE más abajo. Si el dueño anula el
   // pedido después, se repone en POST /admin/purchases/:id (solo pedidos con userId llegan ahí).
