@@ -1046,6 +1046,98 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
   }
 });
 
+// --- Dashboard del panel nuevo ---
+//
+// Se calcula al vuelo sobre orders_location.json y el catálogo cacheado en memoria: con ~8700
+// productos y decenas de pedidos es cuestión de milisegundos, y evita mantener contadores
+// persistidos que se pueden desincronizar. Si el volumen de pedidos crece mucho, el candidato a
+// optimizar es este recorrido, no el del catálogo.
+
+/** Umbral de "poco stock". Mismo criterio que el rail de "últimas piezas" del checkout. */
+const LOW_STOCK_THRESHOLD = 5;
+
+function startOfDaysAgo(days) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - days);
+  return d.getTime();
+}
+
+app.get('/api/admin/dashboard', requireAdminRole('admin', 'empleado'), (req, res) => {
+  const orders = loadOrdersLocation();
+  const products = getMergedProducts();
+  const now = Date.now();
+
+  // Las ventas anuladas no cuentan para ningún total: si no, anular no tendría efecto visible.
+  const vigentes = orders.filter((o) => !o.cancelledAt);
+
+  const rango = (desde) => {
+    const enRango = vigentes.filter((o) => {
+      const t = new Date(o.createdAt).getTime();
+      return Number.isFinite(t) && t >= desde && t <= now;
+    });
+    return {
+      pedidos: enRango.length,
+      // `total` es null en los pedidos anteriores a agosto 2026; se suma solo lo que existe y se
+      // informa cuántos quedaron fuera, para que el número no parezca más chico "sin motivo".
+      monto: enRango.reduce((s, o) => s + (typeof o.total === 'number' ? o.total : 0), 0),
+      sinMonto: enRango.filter((o) => typeof o.total !== 'number').length,
+    };
+  };
+
+  const pendientes = orders.filter((o) => !o.cancelledAt && !o.dispatchedAt);
+
+  // Más vendidos de los últimos 30 días, sumando cantidades por producto.
+  const desde30 = startOfDaysAgo(30);
+  const ventasPorProducto = new Map();
+  for (const o of vigentes) {
+    const t = new Date(o.createdAt).getTime();
+    if (!Number.isFinite(t) || t < desde30) continue;
+    for (const it of Array.isArray(o.items) ? o.items : []) {
+      const prev = ventasPorProducto.get(it.id) || { id: it.id, title: it.title, unidades: 0 };
+      prev.unidades += Number(it.quantity) || 0;
+      ventasPorProducto.set(it.id, prev);
+    }
+  }
+  const masVendidos = [...ventasPorProducto.values()]
+    .sort((a, b) => b.unidades - a.unidades)
+    .slice(0, 8);
+
+  const pocoStock = products
+    .filter((p) => typeof p.stock === 'number' && p.stock > 0 && p.stock < LOW_STOCK_THRESHOLD)
+    .sort((a, b) => a.stock - b.stock);
+
+  const catalogo = {
+    total: products.length,
+    sinFoto: products.filter((p) => !p.image).length,
+    sinDescripcion: products.filter((p) => !p.description || !String(p.description).trim()).length,
+    agotados: products.filter((p) => p.stock === 0).length,
+  };
+
+  const payload = {
+    pendientesDespacho: pendientes.length,
+    catalogo,
+    pocoStock: {
+      umbral: LOW_STOCK_THRESHOLD,
+      total: pocoStock.length,
+      productos: pocoStock.slice(0, 8).map((p) => ({ id: p.id, title: p.title, stock: p.stock })),
+    },
+  };
+
+  // El rol "empleado" no ve plata (ver la definición de roles en 010_admin_users.sql). Se omiten
+  // los campos del lado del servidor en vez de esconderlos en la pantalla: así el dato no viaja.
+  if (req.adminRole === 'admin') {
+    payload.ventas = {
+      hoy: rango(startOfDaysAgo(0)),
+      semana: rango(startOfDaysAgo(7)),
+      mes: rango(startOfDaysAgo(30)),
+    };
+    payload.masVendidos = masVendidos;
+  }
+
+  res.json(payload);
+});
+
 // --- Pedidos desde el panel nuevo: listar, ver detalle, despachar y anular ---
 //
 // La fuente de verdad del estado es NUESTRO registro (orders_location.json), no la tabla purchases
