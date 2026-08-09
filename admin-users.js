@@ -11,7 +11,9 @@ const bcrypt = require('bcryptjs');
 const { supabaseAdmin, isLoyaltyConfigured } = require('./supabase-admin');
 
 const BCRYPT_ROUNDS = 10;
-const ROLES = ['admin', 'empleado', 'salidas'];
+// De mayor a menor. `master` está por encima de admin: ve el contador de ventas siempre y es el
+// único que puede crear otros master o autorizar el contador a un admin (ver server.js).
+const ROLES = ['master', 'admin', 'empleado', 'salidas'];
 const MIN_PASSWORD_LENGTH = 8;
 
 function isAdminUsersConfigured() {
@@ -53,7 +55,7 @@ async function findActiveUser(username) {
   if (!isAdminUsersConfigured()) return null;
   const { data, error } = await supabaseAdmin
     .from('admin_users')
-    .select('id, username, full_name, password_hash, role, active')
+    .select('id, username, full_name, password_hash, role, active, can_view_counter')
     .eq('username', normalizeUsername(username))
     .eq('active', true)
     .maybeSingle();
@@ -84,14 +86,14 @@ async function listUsers() {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
   const { data, error } = await supabaseAdmin
     .from('admin_users')
-    .select('id, username, full_name, role, active, created_at, last_login_at')
+    .select('id, username, full_name, role, active, can_view_counter, created_at, last_login_at')
     .order('active', { ascending: false })
     .order('username');
   if (error) throw new Error(isMissingTable(error) ? MISSING_TABLE_MESSAGE : `No se pudo listar usuarios: ${error.message}`);
   return data || [];
 }
 
-async function createUser({ username, fullName, password, role }) {
+async function createUser({ username, fullName, password, role, canViewCounter = false }) {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
 
   const user = normalizeUsername(username);
@@ -106,8 +108,14 @@ async function createUser({ username, fullName, password, role }) {
   const password_hash = await bcrypt.hash(String(password), BCRYPT_ROUNDS);
   const { data, error } = await supabaseAdmin
     .from('admin_users')
-    .insert({ username: user, full_name: String(fullName).trim(), password_hash, role })
-    .select('id, username, full_name, role, active, created_at, last_login_at')
+    .insert({
+      username: user,
+      full_name: String(fullName).trim(),
+      password_hash,
+      role,
+      can_view_counter: Boolean(canViewCounter),
+    })
+    .select('id, username, full_name, role, active, can_view_counter, created_at, last_login_at')
     .single();
 
   // 23505 = unique_violation. Se traduce a un mensaje entendible en vez del error crudo de Postgres.
@@ -120,7 +128,7 @@ async function createUser({ username, fullName, password, role }) {
 }
 
 /** Cambia rol y/o estado activo. No toca la contraseña — para eso está resetPassword(). */
-async function updateUser(id, { role, active }) {
+async function updateUser(id, { role, active, canViewCounter }) {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
 
   const patch = {};
@@ -129,13 +137,14 @@ async function updateUser(id, { role, active }) {
     patch.role = role;
   }
   if (active !== undefined) patch.active = Boolean(active);
+  if (canViewCounter !== undefined) patch.can_view_counter = Boolean(canViewCounter);
   if (Object.keys(patch).length === 0) throw new Error('No hay nada que cambiar.');
 
   const { data, error } = await supabaseAdmin
     .from('admin_users')
     .update(patch)
     .eq('id', id)
-    .select('id, username, full_name, role, active, created_at, last_login_at')
+    .select('id, username, full_name, role, active, can_view_counter, created_at, last_login_at')
     .maybeSingle();
   if (error) throw new Error(`No se pudo actualizar el usuario: ${error.message}`);
   if (!data) throw new Error('Usuario no encontrado.');
@@ -159,13 +168,16 @@ async function resetPassword(id, newPassword) {
   return data;
 }
 
-/** Cuántos admins activos hay — para no dejar el panel sin ningún administrador. */
+/**
+ * Cuántas cuentas con poder de administración activas hay (master + admin) — para no dejar el panel
+ * sin nadie que pueda gestionarlo. Cuenta las dos: un master es administrador y más.
+ */
 async function countActiveAdmins() {
   if (!isAdminUsersConfigured()) return 0;
   const { count, error } = await supabaseAdmin
     .from('admin_users')
     .select('id', { count: 'exact', head: true })
-    .eq('role', 'admin')
+    .in('role', ['master', 'admin'])
     .eq('active', true);
   if (error) throw new Error(`No se pudo contar administradores: ${error.message}`);
   return count || 0;

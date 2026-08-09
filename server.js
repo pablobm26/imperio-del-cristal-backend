@@ -883,6 +883,11 @@ function signAdminToken(role, actor = {}) {
       role,
       sub: actor.sub || null,
       username: actor.username || role,
+      // `cvc` = can view counter. Va firmado en el token para no pegarle a Supabase en cada
+      // request del contador, que se refresca solo cada minuto desde varias pantallas.
+      // Contrapartida: si se revoca el permiso, tarda hasta 12h (lo que dura el token) en aplicar,
+      // o hasta que la persona vuelva a entrar. Aceptable para un permiso de solo lectura.
+      cvc: actor.canViewCounter ? 1 : 0,
       exp: Date.now() + ADMIN_TOKEN_TTL_MS,
     })
   ).toString('base64url');
@@ -904,7 +909,7 @@ function verifyAdminToken(token) {
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     if (!data.exp || data.exp < Date.now()) return null;
-    return data; // { role, sub, username, exp }
+    return data; // { role, sub, username, cvc, exp }
   } catch {
     return null;
   }
@@ -918,11 +923,19 @@ function requireAdminRole(...allowedRoles) {
     const auth = req.headers.authorization || '';
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
     const data = verifyAdminToken(token);
-    if (!data || !allowedRoles.includes(data.role)) {
+    // `master` está por encima de todo: satisface cualquier requisito sin tener que agregarlo a
+    // mano en cada llamada a requireAdminRole(). Si se olvidara en alguna, el master quedaría
+    // afuera de una pantalla que debería poder ver — este atajo lo hace imposible.
+    const permitido = data && (data.role === 'master' || allowedRoles.includes(data.role));
+    if (!permitido) {
       return res.status(401).json({ error: 'No autorizado.' });
     }
     req.adminRole = data.role;
-    req.adminUser = { sub: data.sub || null, username: data.username || data.role };
+    req.adminUser = {
+      sub: data.sub || null,
+      username: data.username || data.role,
+      canViewCounter: Boolean(data.cvc),
+    };
     next();
   };
 }
@@ -950,11 +963,20 @@ async function authenticateAdmin(username, password) {
     adminUsers.touchLastLogin(user.id).catch((err) =>
       console.error('No se pudo actualizar last_login_at:', err.message)
     );
-    return { role: user.role, sub: user.id, username: user.username, fullName: user.full_name };
+    return {
+      role: user.role,
+      sub: user.id,
+      username: user.username,
+      fullName: user.full_name,
+      canViewCounter: Boolean(user.can_view_counter),
+    };
   }
 
+  // La cuenta de respaldo por variables de entorno es la del dueño y es la vía de emergencia
+  // cuando Supabase falla: se le da rol `master` para que nunca quede por debajo de una cuenta de
+  // la base. Además garantiza que SIEMPRE exista un master que pueda crear otros.
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-    return { role: 'admin', sub: null, username: ADMIN_USERNAME, fullName: 'Administrador' };
+    return { role: 'master', sub: null, username: ADMIN_USERNAME, fullName: 'Dueño', canViewCounter: true };
   }
   if (username === SALIDAS_USERNAME && password === SALIDAS_PASSWORD) {
     return { role: 'salidas', sub: null, username: SALIDAS_USERNAME, fullName: 'Salidas' };
@@ -981,10 +1003,15 @@ app.post('/api/admin/login', async (req, res) => {
   if (!account) return res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
 
   res.json({
-    token: signAdminToken(account.role, { sub: account.sub, username: account.username }),
+    token: signAdminToken(account.role, {
+      sub: account.sub,
+      username: account.username,
+      canViewCounter: account.canViewCounter,
+    }),
     role: account.role,
     username: account.username,
     fullName: account.fullName,
+    canViewCounter: Boolean(account.canViewCounter),
   });
 });
 
@@ -1002,43 +1029,68 @@ app.get('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
 });
 
 app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
+  const { username, fullName, password, role, canViewCounter } = req.body || {};
+
+  // Un admin no puede crear un master ni regalar el permiso del contador: si pudiera, el rol
+  // superior no significaría nada — cualquier admin se fabricaría uno y se lo daría a sí mismo.
+  // Va ANTES del chequeo de Supabase a propósito: una decisión de permisos no debe depender del
+  // estado de la infraestructura, y con el orden inverso un 503 tapaba el 403.
+  if (req.adminRole !== 'master' && (role === 'master' || canViewCounter)) {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede crear cuentas Master o autorizar el contador de ventas.' });
+  }
   if (!adminUsers.isAdminUsersConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado: no hay tabla de usuarios todavía.' });
   }
-  const { username, fullName, password, role } = req.body || {};
+
   try {
-    res.status(201).json({ user: await adminUsers.createUser({ username, fullName, password, role }) });
+    res.status(201).json({
+      user: await adminUsers.createUser({ username, fullName, password, role, canViewCounter }),
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
 app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) => {
+  const { role, active, password, canViewCounter } = req.body || {};
+  const esMaster = req.adminRole === 'master';
+  const pierdeAdmin = role !== undefined && role !== 'admin' && role !== 'master';
+
+  // Nadie puede desactivarse ni degradarse a sí mismo: es la forma más fácil de quedarse afuera
+  // del panel sin querer. Que lo haga otra cuenta con permisos.
+  if (req.adminUser.sub && req.adminUser.sub === req.params.id && (active === false || pierdeAdmin)) {
+    return res.status(400).json({ error: 'No podés desactivar ni bajarte el rol a vos mismo.' });
+  }
+  if (!esMaster && (role === 'master' || canViewCounter !== undefined)) {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede asignar el rol Master o autorizar el contador de ventas.' });
+  }
+  // Igual que en POST: los permisos se deciden antes que el estado de la infraestructura.
   if (!adminUsers.isAdminUsersConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado: no hay tabla de usuarios todavía.' });
   }
-  const { role, active, password } = req.body || {};
-
-  // Nadie puede desactivarse ni degradarse a sí mismo: es la forma más fácil de quedarse afuera
-  // del panel sin querer. Que lo haga otro administrador.
-  if (req.adminUser.sub && req.adminUser.sub === req.params.id && (active === false || (role && role !== 'admin'))) {
-    return res.status(400).json({ error: 'No podés desactivar ni cambiarle el rol a tu propia cuenta.' });
-  }
 
   try {
-    // Guarda contra quedarse sin ningún administrador activo. Se chequea antes de escribir.
-    if (active === false || (role && role !== 'admin')) {
-      const target = (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
-      if (target && target.role === 'admin' && target.active && (await adminUsers.countActiveAdmins()) <= 1) {
-        return res.status(400).json({ error: 'Es el último administrador activo. Creá otro antes de tocar esta cuenta.' });
+    const target = (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
+    if (!target) return res.status(404).json({ error: 'Usuario no encontrado.' });
+
+    // Un admin no puede tocar a un master: solo un par o superior puede hacerlo.
+    if (!esMaster && target.role === 'master') {
+      return res.status(403).json({ error: 'Solo otra cuenta Master puede modificar a un Master.' });
+    }
+
+    // Guarda contra quedarse sin ninguna cuenta con poder de administración (master o admin).
+    if (active === false || pierdeAdmin) {
+      const eraAdmin = target.role === 'admin' || target.role === 'master';
+      if (eraAdmin && target.active && (await adminUsers.countActiveAdmins()) <= 1) {
+        return res.status(400).json({ error: 'Es la última cuenta con permisos de administración. Creá otra antes de tocar esta.' });
       }
     }
 
     if (password !== undefined) await adminUsers.resetPassword(req.params.id, password);
-    const user =
-      role !== undefined || active !== undefined
-        ? await adminUsers.updateUser(req.params.id, { role, active })
-        : (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
+    const cambiaAlgo = role !== undefined || active !== undefined || canViewCounter !== undefined;
+    const user = cambiaAlgo
+      ? await adminUsers.updateUser(req.params.id, { role, active, canViewCounter })
+      : (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
 
     res.json({ user });
   } catch (err) {
@@ -1199,6 +1251,66 @@ app.get('/api/admin/customers/:key', requireAdminRole('admin'), async (req, res)
     },
     loyalty,
     orders: suyos.map(orderSummary),
+  });
+});
+
+// --- Contador de ventas del día (barra fija del panel) ---
+//
+// Solo para rol `master`, o para un `admin` con el permiso `can_view_counter` activado desde la
+// pantalla de usuarios. Es información sensible del negocio y el dueño quiso poder darla caso a caso.
+
+/** Venezuela es UTC-4 todo el año (no tiene horario de verano). */
+const VE_UTC_OFFSET_HOURS = -4;
+
+/**
+ * Instante en que empezó el día EN VENEZUELA. Render corre en UTC, así que usar la medianoche del
+ * servidor reiniciaría el contador a las 8 de la noche hora local — que es justo el horario en que
+ * el dueño estaría mirando las ventas del día.
+ */
+function startOfTodayVenezuela() {
+  const ahora = new Date();
+  // Se corre el reloj a hora local de Venezuela, se trunca el día ahí, y se vuelve a UTC.
+  const enVE = new Date(ahora.getTime() + VE_UTC_OFFSET_HOURS * 3600_000);
+  const inicioVE = Date.UTC(enVE.getUTCFullYear(), enVE.getUTCMonth(), enVE.getUTCDate());
+  return inicioVE - VE_UTC_OFFSET_HOURS * 3600_000;
+}
+
+function puedeVerContador(req) {
+  return req.adminRole === 'master' || req.adminUser.canViewCounter === true;
+}
+
+app.get('/api/admin/counter', requireAdminRole('master', 'admin'), (req, res) => {
+  if (!puedeVerContador(req)) {
+    return res.status(403).json({ error: 'Tu cuenta no tiene autorizado ver el contador de ventas.' });
+  }
+
+  const desde = startOfTodayVenezuela();
+  const orders = loadOrdersLocation();
+
+  // "Del día" se mide por fecha de CREACIÓN del pedido. Un pedido de ayer despachado hoy no suma a
+  // las ventas de hoy, pero sí al contador de despachos, que es una métrica de operación.
+  const deHoy = orders.filter((o) => {
+    const t = new Date(o.createdAt).getTime();
+    return Number.isFinite(t) && t >= desde && !o.cancelledAt;
+  });
+  const despachadosHoy = orders.filter((o) => {
+    const t = new Date(o.dispatchedAt || 0).getTime();
+    return Number.isFinite(t) && t >= desde && !o.cancelledAt;
+  });
+
+  const usd = deHoy.reduce((s, o) => s + (typeof o.total === 'number' ? o.total : 0), 0);
+  const rate = bcvRateCache && bcvRateCache.rate ? bcvRateCache.rate : null;
+
+  res.json({
+    ventas: deHoy.length,
+    despachados: despachadosHoy.length,
+    usd,
+    // Sin tasa en caché se devuelve null en vez de un 0 que parecería una venta de cero bolívares.
+    bs: rate ? Math.round(usd * rate * 100) / 100 : null,
+    bcvRate: rate,
+    // Para que el frontend sepa cuándo se reinicia sin recalcular la zona horaria por su cuenta.
+    desde: new Date(desde).toISOString(),
+    sinMonto: deHoy.filter((o) => typeof o.total !== 'number').length,
   });
 });
 
