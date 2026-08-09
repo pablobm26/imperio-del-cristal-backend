@@ -1046,6 +1046,135 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
   }
 });
 
+// --- Reseñas y clientes desde el panel nuevo ---
+//
+// Ambas cosas son solo para rol `admin`: borrar una reseña es irreversible, y la ficha de cliente
+// expone datos personales (cédula, teléfono, correo, historial de compras). Si más adelante hace
+// falta que `empleado` atienda consultas, se puede abrir la lectura de clientes sin abrir el borrado.
+
+app.get('/api/admin/reviews', requireAdminRole('admin'), (req, res) => {
+  const reviews = loadReviews();
+  const titles = new Map(loadProducts().map((p) => [p.id, p.title]));
+
+  // reviews.json está indexado por producto; para moderar conviene verlas todas juntas y por fecha.
+  const todas = [];
+  for (const [productId, lista] of Object.entries(reviews)) {
+    for (const r of lista || []) {
+      todas.push({
+        ...r,
+        productId,
+        // Un producto puede haber desaparecido del catálogo tras una sync de PLADE y su reseña
+        // quedar huérfana: se muestra igual, con el id, en vez de esconderla.
+        productTitle: titles.get(productId) || null,
+      });
+    }
+  }
+  todas.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+
+  res.json({ total: todas.length, reviews: todas.slice(0, 200) });
+});
+
+app.delete('/api/admin/reviews/:productId/:reviewId', requireAdminRole('admin'), (req, res) => {
+  const reviews = loadReviews();
+  const lista = reviews[req.params.productId];
+  if (!lista) return res.status(404).json({ error: 'Producto sin reseñas.' });
+
+  const restantes = lista.filter((r) => r.id !== req.params.reviewId);
+  if (restantes.length === lista.length) return res.status(404).json({ error: 'Reseña no encontrada.' });
+
+  reviews[req.params.productId] = restantes;
+  saveReviews(reviews);
+  res.json({ ok: true, ...ratingSummary(restantes) });
+});
+
+/**
+ * Clientes. La lista sale de customers.json (que se llena en cada checkout, incluidos invitados) y
+ * se enriquece con los pedidos reales. El cruce es por TELÉFONO: es el único dato que guardan tanto
+ * el pedido como la ficha del cliente — los pedidos anteriores al 2026-08-09 no tienen cédula.
+ */
+function ordersForPhone(orders, telefono) {
+  if (!telefono) return [];
+  const norm = (v) => String(v || '').replace(/\D/g, '');
+  const objetivo = norm(telefono);
+  if (!objetivo) return [];
+  return orders.filter((o) => norm(o.telefono) === objetivo);
+}
+
+app.get('/api/admin/customers', requireAdminRole('admin'), (req, res) => {
+  const search = String(req.query.search || '').trim().toLowerCase();
+  const customers = loadCustomers();
+  const orders = loadOrdersLocation();
+
+  let filas = Object.entries(customers).map(([key, c]) => {
+    const suyos = ordersForPhone(orders, c.telefono).filter((o) => !o.cancelledAt);
+    return {
+      key,
+      nombre: c.nombre || null,
+      cedula: `${c.idType || ''}-${c.cedula || ''}`.replace(/^-|-$/g, '') || null,
+      telefono: c.telefono || null,
+      correo: c.correo || null,
+      firstSeen: c.firstSeen || null,
+      lastSeen: c.lastSeen || null,
+      // orderCount lo lleva customers.json; los pedidos cruzados pueden diferir si cambió de
+      // teléfono entre compras. Se muestran los dos en vez de elegir uno y ocultar la diferencia.
+      orderCount: c.orderCount ?? null,
+      pedidosCruzados: suyos.length,
+      totalGastado: suyos.reduce((s, o) => s + (typeof o.total === 'number' ? o.total : 0), 0),
+    };
+  });
+
+  if (search) {
+    filas = filas.filter((c) =>
+      [c.nombre, c.cedula, c.telefono, c.correo]
+        .filter(Boolean)
+        .some((v) => String(v).toLowerCase().includes(search))
+    );
+  }
+  filas.sort((a, b) => String(b.lastSeen || '').localeCompare(String(a.lastSeen || '')));
+
+  res.json({ total: filas.length, customers: filas.slice(0, 200) });
+});
+
+app.get('/api/admin/customers/:key', requireAdminRole('admin'), async (req, res) => {
+  const customers = loadCustomers();
+  const c = customers[req.params.key];
+  if (!c) return res.status(404).json({ error: 'Cliente no encontrado.' });
+
+  const orders = loadOrdersLocation();
+  const suyos = ordersForPhone(orders, c.telefono).sort((a, b) =>
+    String(b.createdAt).localeCompare(String(a.createdAt))
+  );
+
+  // Nivel de fidelidad: solo se puede resolver si alguna de sus compras quedó registrada en
+  // Supabase, que pasa únicamente cuando compró con sesión iniciada. Para un invitado no existe, y
+  // eso es normal — se devuelve null en vez de inventar un nivel.
+  let loyalty = null;
+  if (isLoyaltyConfigured() && suyos.length) {
+    try {
+      const ids = new Set(suyos.map((o) => o.orderId));
+      const purchase = (await listPurchases()).find((p) => ids.has(p.order_id) && p.user_id);
+      if (purchase) loyalty = await getLoyaltyForUser(purchase.user_id);
+    } catch (err) {
+      console.error(`No se pudo resolver la fidelidad de ${req.params.key}:`, err.message);
+    }
+  }
+
+  res.json({
+    customer: {
+      key: req.params.key,
+      nombre: c.nombre || null,
+      cedula: `${c.idType || ''}-${c.cedula || ''}`.replace(/^-|-$/g, '') || null,
+      telefono: c.telefono || null,
+      correo: c.correo || null,
+      firstSeen: c.firstSeen || null,
+      lastSeen: c.lastSeen || null,
+      orderCount: c.orderCount ?? null,
+    },
+    loyalty,
+    orders: suyos.map(orderSummary),
+  });
+});
+
 // --- Dashboard del panel nuevo ---
 //
 // Se calcula al vuelo sobre orders_location.json y el catálogo cacheado en memoria: con ~8700
@@ -2194,6 +2323,11 @@ app.post('/api/orders', (req, res) => {
     // (POST /api/admin/scan) sin tener que cruzar con otro archivo.
     nombre,
     telefono,
+    // Se agregan 2026-08-09 para que la ficha del pedido en el panel nuevo muestre al cliente
+    // completo sin cruzar con customers.json. Los pedidos anteriores no los tienen: la pantalla
+    // simplemente omite esas filas.
+    cedula: `${idType}-${cedula}`,
+    correo,
     total: finalTotal,
     dispatchedAt: null,
     dispatchedBy: null,
