@@ -1052,6 +1052,8 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
 // expone datos personales (cédula, teléfono, correo, historial de compras). Si más adelante hace
 // falta que `empleado` atienda consultas, se puede abrir la lectura de clientes sin abrir el borrado.
 
+const ADMIN_REVIEWS_PAGE_SIZE = 25;
+
 app.get('/api/admin/reviews', requireAdminRole('admin'), (req, res) => {
   const reviews = loadReviews();
   const titles = new Map(loadProducts().map((p) => [p.id, p.title]));
@@ -1071,7 +1073,24 @@ app.get('/api/admin/reviews', requireAdminRole('admin'), (req, res) => {
   }
   todas.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 
-  res.json({ total: todas.length, reviews: todas.slice(0, 200) });
+  // Conteo por estrellas, siempre sobre el total: es lo que permite ir directo a las de 1 estrella,
+  // que son las que urge revisar. Se calcula antes de filtrar para que las pestañas no cambien de
+  // número al entrar a un grupo.
+  const counts = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+  for (const r of todas) if (counts[r.rating] !== undefined) counts[r.rating]++;
+
+  const rating = parseInt(req.query.rating, 10);
+  const filtradas = rating >= 1 && rating <= 5 ? todas.filter((r) => r.rating === rating) : todas;
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+  res.json({
+    total: filtradas.length,
+    totalGeneral: todas.length,
+    counts,
+    offset,
+    pageSize: ADMIN_REVIEWS_PAGE_SIZE,
+    reviews: filtradas.slice(offset, offset + ADMIN_REVIEWS_PAGE_SIZE),
+  });
 });
 
 app.delete('/api/admin/reviews/:productId/:reviewId', requireAdminRole('admin'), (req, res) => {
@@ -1099,6 +1118,8 @@ function ordersForPhone(orders, telefono) {
   if (!objetivo) return [];
   return orders.filter((o) => norm(o.telefono) === objetivo);
 }
+
+const ADMIN_CUSTOMERS_PAGE_SIZE = 25;
 
 app.get('/api/admin/customers', requireAdminRole('admin'), (req, res) => {
   const search = String(req.query.search || '').trim().toLowerCase();
@@ -1132,7 +1153,13 @@ app.get('/api/admin/customers', requireAdminRole('admin'), (req, res) => {
   }
   filas.sort((a, b) => String(b.lastSeen || '').localeCompare(String(a.lastSeen || '')));
 
-  res.json({ total: filas.length, customers: filas.slice(0, 200) });
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+  res.json({
+    total: filas.length,
+    offset,
+    pageSize: ADMIN_CUSTOMERS_PAGE_SIZE,
+    customers: filas.slice(offset, offset + ADMIN_CUSTOMERS_PAGE_SIZE),
+  });
 });
 
 app.get('/api/admin/customers/:key', requireAdminRole('admin'), async (req, res) => {
@@ -1274,7 +1301,7 @@ app.get('/api/admin/dashboard', requireAdminRole('admin', 'empleado'), (req, res
 // invitados no tienen fila ahí. Al anular se sincroniza purchases si hay una fila que corresponda,
 // pero el stock y el estado se manejan siempre contra nuestro propio registro, que siempre existe.
 
-const ADMIN_ORDERS_PAGE_SIZE = 40;
+const ADMIN_ORDERS_PAGE_SIZE = 25;
 
 function orderSummary(order) {
   return {
@@ -1421,7 +1448,7 @@ app.post('/api/admin/orders/:orderId/cancel', requireAdminRole('admin'), async (
 // quiere delegar al personal. No toca precios ni stock (eso lo manda PLADE) ni el catálogo crudo:
 // todo va a product_details.json, la capa que sobrevive a las sincronizaciones.
 
-const ADMIN_PRODUCTS_PAGE_SIZE = 60;
+const ADMIN_PRODUCTS_PAGE_SIZE = 30;
 
 app.get('/api/admin/products', requireAdminRole('admin', 'empleado'), (req, res) => {
   const search = String(req.query.search || '').trim().toLowerCase();
@@ -1437,6 +1464,21 @@ app.get('/api/admin/products', requireAdminRole('admin', 'empleado'), (req, res)
     );
   }
 
+  // Categorías CON su conteo, calculadas después del filtro pero antes de elegir una: así se ve
+  // "sin foto: HILOS (174), ACRILICOS (89)…" y se puede atacar el catálogo por bloques en vez de
+  // recorrer 3644 fichas sueltas. Ordenadas por cantidad: primero donde hay más trabajo.
+  const porCategoria = new Map();
+  for (const p of products) {
+    const c = p.category || 'General';
+    porCategoria.set(c, (porCategoria.get(c) || 0) + 1);
+  }
+  const categories = [...porCategoria.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+  const category = String(req.query.category || '');
+  if (category) products = products.filter((p) => (p.category || 'General') === category);
+
   const total = products.length;
   const page = products.slice(offset, offset + ADMIN_PRODUCTS_PAGE_SIZE).map((p) => ({
     id: p.id,
@@ -1449,7 +1491,7 @@ app.get('/api/admin/products', requireAdminRole('admin', 'empleado'), (req, res)
     hasDescription: Boolean(p.description && p.description.trim()),
   }));
 
-  res.json({ total, offset, pageSize: ADMIN_PRODUCTS_PAGE_SIZE, products: page });
+  res.json({ total, offset, pageSize: ADMIN_PRODUCTS_PAGE_SIZE, categories, products: page });
 });
 
 app.get('/api/admin/products/:id', requireAdminRole('admin', 'empleado'), (req, res) => {
