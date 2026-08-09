@@ -37,6 +37,24 @@ function isMissingTable(error) {
   return error && (error.code === '42P01' || error.code === 'PGRST205');
 }
 
+/**
+ * Falta una COLUMNA que el código ya pide pero la base todavía no tiene, porque la migración
+ * correspondiente no se corrió. Postgres: 42703 (undefined_column); PostgREST: PGRST204.
+ *
+ * Por qué existe este chequeo: al agregar `can_view_counter` (migración 011) la consulta de login
+ * empezó a pedir esa columna. En producción, con la migración sin correr, el error no estaba
+ * contemplado, se propagaba, y el login devolvía **500 para todo el mundo** — incluidas las cuentas
+ * ya creadas y el respaldo por variables de entorno. Un bloqueo total del panel.
+ * Regla para el futuro: cada columna nueva que se agregue a un SELECT del login necesita este
+ * camino de degradación, o el deploy tiene que ir SIEMPRE después de la migración.
+ */
+function isMissingColumn(error) {
+  return error && (error.code === '42703' || error.code === 'PGRST204');
+}
+
+/** Columnas que existen desde la migración 010; siempre seguras de pedir. */
+const COLUMNAS_BASE = 'id, username, full_name, password_hash, role, active';
+
 /** Mensaje único para las pantallas de gestión cuando falta correr la migración. */
 const MISSING_TABLE_MESSAGE =
   'La tabla admin_users no existe todavía. Corré supabase/010_admin_users.sql en el SQL Editor de Supabase.';
@@ -53,12 +71,28 @@ const MISSING_TABLE_MESSAGE =
  */
 async function findActiveUser(username) {
   if (!isAdminUsersConfigured()) return null;
-  const { data, error } = await supabaseAdmin
-    .from('admin_users')
-    .select('id, username, full_name, password_hash, role, active, can_view_counter')
-    .eq('username', normalizeUsername(username))
-    .eq('active', true)
-    .maybeSingle();
+  const user = normalizeUsername(username);
+
+  const consultar = (columnas) =>
+    supabaseAdmin
+      .from('admin_users')
+      .select(columnas)
+      .eq('username', user)
+      .eq('active', true)
+      .maybeSingle();
+
+  let { data, error } = await consultar(`${COLUMNAS_BASE}, can_view_counter`);
+
+  // Si falta `can_view_counter` (migración 011 sin correr) se reintenta con las columnas viejas,
+  // en vez de dejar afuera a cuentas que SÍ existen. El permiso queda en false hasta que se corra.
+  if (error && isMissingColumn(error)) {
+    console.warn(
+      'Login: falta la columna can_view_counter. Corré supabase/011_admin_master_role.sql. ' +
+        'Mientras tanto se ignora el permiso del contador.'
+    );
+    ({ data, error } = await consultar(COLUMNAS_BASE));
+  }
+
   if (error) {
     if (isMissingTable(error)) {
       console.warn(`Login: ${MISSING_TABLE_MESSAGE} Usando el respaldo por variables de entorno.`);
@@ -84,11 +118,23 @@ async function touchLastLogin(id) {
 /** Listado para la pantalla de usuarios. Nunca devuelve el hash. */
 async function listUsers() {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
-  const { data, error } = await supabaseAdmin
-    .from('admin_users')
-    .select('id, username, full_name, role, active, can_view_counter, created_at, last_login_at')
-    .order('active', { ascending: false })
-    .order('username');
+  const consultar = (columnas) =>
+    supabaseAdmin
+      .from('admin_users')
+      .select(columnas)
+      .order('active', { ascending: false })
+      .order('username');
+
+  const LISTA = 'id, username, full_name, role, active, created_at, last_login_at';
+  let { data, error } = await consultar(`${LISTA}, can_view_counter`);
+
+  // Igual que en findActiveUser: sin la migración 011 la pantalla de usuarios seguiría funcionando,
+  // solo que sin el permiso del contador, en vez de romperse entera.
+  if (error && isMissingColumn(error)) {
+    ({ data, error } = await consultar(LISTA));
+    if (!error && data) data = data.map((u) => ({ ...u, can_view_counter: false }));
+  }
+
   if (error) throw new Error(isMissingTable(error) ? MISSING_TABLE_MESSAGE : `No se pudo listar usuarios: ${error.message}`);
   return data || [];
 }

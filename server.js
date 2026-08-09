@@ -956,7 +956,16 @@ function requireAdminRole(...allowedRoles) {
  * un problema en la base te deja afuera de tu propio panel sin forma de arreglarlo.
  */
 async function authenticateAdmin(username, password) {
-  const user = await adminUsers.findActiveUser(username);
+  // Un fallo de Supabase NUNCA debe bloquear el acceso al panel: se registra y se sigue con el
+  // respaldo por variables de entorno. Pasó de verdad el 2026-08-09 — una columna nueva que la base
+  // todavía no tenía hacía que esto lanzara, y el login devolvía 500 para todo el mundo, incluido
+  // el dueño. La disponibilidad del panel no puede depender de que la base esté impecable.
+  let user = null;
+  try {
+    user = await adminUsers.findActiveUser(username);
+  } catch (err) {
+    console.error('No se pudo consultar admin_users; se usa el respaldo por variables de entorno:', err.message);
+  }
   if (user) {
     const ok = await adminUsers.verifyPassword(password, user.password_hash);
     if (!ok) return null;
