@@ -99,6 +99,53 @@ const FIELD_SYNONYMS = {
 // Fields editable manually from /admin/products (in addition to whatever the Excel provides)
 const DETAIL_FIELDS = ['width', 'height', 'length', 'material', 'weight', 'color', 'image', 'image2', 'image3', 'image4', 'video', 'description'];
 
+// Mapeo de columnas del importador masivo de detalles (POST /admin/details-upload). Aparte de
+// FIELD_SYNONYMS a propósito: ese alimenta la carga del catálogo CRUDO (/admin/upload) y no debe
+// cambiar de comportamiento. Este, en cambio, escribe en product_details.json — la capa que
+// sobrevive a las sincronizaciones con PLADE, que es justo lo que hace falta para las imágenes
+// 2-5 y las descripciones (getInventario solo devuelve UN campo `imagen` y ninguna descripción
+// larga; verificado contra la instancia real el 2026-08-09, ver HANDOFF 2.11).
+const DETAIL_FIELD_SYNONYMS = {
+  sku: ['codigo', 'sku', 'referencia', 'cod', 'codigoproducto', 'codigointerno', 'id'],
+  description: ['descripcion', 'descripcionlarga', 'detalle', 'observacion', 'texto'],
+  image: ['imagen', 'imagen1', 'foto', 'foto1', 'urlimagen', 'image', 'image1'],
+  image2: ['imagen2', 'foto2', 'image2', 'urlimagen2'],
+  image3: ['imagen3', 'foto3', 'image3', 'urlimagen3'],
+  image4: ['imagen4', 'foto4', 'image4', 'urlimagen4'],
+  video: ['video', 'urlvideo', 'videourl'],
+  material: ['material', 'materiales'],
+  color: ['color', 'colores'],
+  width: ['ancho', 'anchocm', 'width'],
+  height: ['alto', 'altocm', 'height'],
+  length: ['largo', 'largocm', 'profundidad', 'length', 'depth'],
+  weight: ['peso', 'pesog', 'pesokg', 'weight'],
+};
+
+const DETAIL_TEXT_FIELDS = ['description', 'image', 'image2', 'image3', 'image4', 'video', 'material', 'color'];
+const DETAIL_NUMBER_FIELDS = ['width', 'height', 'length', 'weight'];
+
+/**
+ * Lee un CSV/XLSX detectando la codificación. SheetJS, ante un CSV sin BOM, asume la codepage
+ * heredada de Windows (1252/Latin-1): un archivo UTF-8 entra como "macramÃ©" en vez de "macramé".
+ * Forzar siempre 65001 tampoco sirve — Excel en Windows exporta CSV en ANSI por defecto y esos se
+ * romperían al revés. Por eso se decide por archivo: si el contenido es UTF-8 válido, se lee como
+ * UTF-8; si no, se deja que SheetJS aplique su codepage por defecto.
+ * (Los .xlsx no se ven afectados: guardan el texto en UTF-8 dentro del ZIP y SheetJS ya lo respeta.)
+ */
+function readWorkbookAutoEncoding(buffer) {
+  const hasUtf8Bom = buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf;
+  let isUtf8 = hasUtf8Bom;
+  if (!isUtf8) {
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+      isUtf8 = true;
+    } catch {
+      isUtf8 = false; // secuencias inválidas en UTF-8 => es un archivo de codepage heredada
+    }
+  }
+  return XLSX.read(buffer, { type: 'buffer', ...(isUtf8 ? { codepage: 65001 } : {}) });
+}
+
 function normalize(header) {
   return String(header)
     .normalize('NFD')
@@ -107,10 +154,12 @@ function normalize(header) {
     .replace(/[^a-z0-9]/g, '');
 }
 
-function buildColumnMap(headers) {
+// `synonyms` es parametrizable para que el importador de detalles pueda usar su propio mapeo
+// (DETAIL_FIELD_SYNONYMS) sin alterar el de la carga del catálogo crudo, que sigue siendo el default.
+function buildColumnMap(headers, synonymMap = FIELD_SYNONYMS) {
   const normalizedHeaders = headers.map(normalize);
   const map = {};
-  for (const [field, synonyms] of Object.entries(FIELD_SYNONYMS)) {
+  for (const [field, synonyms] of Object.entries(synonymMap)) {
     const idx = normalizedHeaders.findIndex((h) => synonyms.includes(h));
     if (idx !== -1) map[field] = headers[idx];
   }
@@ -949,9 +998,34 @@ app.get('/admin', (req, res) => {
     <input type="file" name="file" accept=".csv,.xlsx,.xls" required>
     <button type="submit">Subir y reemplazar inventario</button>
   </form>
-  <div class="status">Productos actualmente cargados: <b>${products.length}</b></div>
+  <div class="status">Productos actualmente cargados: <b>${products.length}</b>
+    &nbsp;·&nbsp; con foto: <b>${products.filter((p) => p.image).length}</b>
+    &nbsp;·&nbsp; con descripción: <b>${products.filter((p) => p.description && String(p.description).trim()).length}</b>
+  </div>
 
-  <div class="status">
+  <h1 style="margin-top:36px">Cargar descripciones e imágenes adicionales</h1>
+  <p>
+    PLADE solo envía <b>una</b> imagen por producto y ninguna descripción larga, así que esos datos se
+    cargan por acá. A diferencia del formulario de arriba, esto <b>no reemplaza el inventario</b>: se
+    guarda en una capa aparte que se fusiona al mostrar el catálogo, por lo que
+    <b>la sincronización con PLADE no lo pisa</b>.
+  </p>
+  <p>
+    Columna obligatoria: <b>Codigo</b> (el mismo código interno del producto).<br>
+    Columnas opcionales, las que quieras incluir: <b>Descripcion, Imagen, Imagen2, Imagen3, Imagen4,
+    Video, Material, Color, Ancho, Alto, Largo, Peso</b>.<br>
+    Una celda vacía deja el valor que ya estuviera cargado — no lo borra.
+  </p>
+  <form action="/admin/details-upload" method="post" enctype="multipart/form-data">
+    <label>Contraseña de administración</label>
+    <input type="password" name="password" required>
+    <label>Archivo (.csv, .xlsx, .xls)</label>
+    <input type="file" name="file" accept=".csv,.xlsx,.xls" required>
+    <button type="submit">Cargar descripciones e imágenes</button>
+  </form>
+  <a class="link-btn" href="/admin/details-template.csv">Descargar planilla de ejemplo (.csv) &rarr;</a>
+
+  <div class="status" style="margin-top:36px">
     <b>Sincronización con PLADE SOFTWARE:</b>
     ${isPladeConfigured() ? 'activa (cada 30 min)' : 'no configurada (faltan variables de entorno PLADE_USER/PLADE_PASSWORD/PLADE_TOKEN)'}<br>
     ${lastPladeSync
@@ -1002,7 +1076,7 @@ app.post('/admin/upload', upload.single('file'), (req, res) => {
   }
 
   try {
-    const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
+    const workbook = readWorkbookAutoEncoding(req.file.buffer);
     const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
     const rows = XLSX.utils.sheet_to_json(firstSheet, { defval: '' });
 
@@ -1026,6 +1100,139 @@ app.post('/admin/upload', upload.single('file'), (req, res) => {
     res.send(`Inventario actualizado: ${products.length} productos cargados. <a href="/admin">Volver</a>`);
   } catch (err) {
     res.status(500).send(`Error procesando el archivo: ${err.message}. <a href="/admin">Volver</a>`);
+  }
+});
+
+function csvCell(value) {
+  const s = String(value ?? '');
+  // Los títulos del catálogo traen comas y comillas — sin escapar, la planilla queda corrida.
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/**
+ * Planilla para el importador de detalles. No es un ejemplo vacío: viene precargada con los
+ * productos que HOY no tienen foto, que son los que hay que atacar primero (Google necesita una
+ * imagen para mostrar un resultado enriquecido de producto). La columna Nombre va solo como
+ * referencia para quien llena la planilla — el importador la ignora, matchea por Codigo.
+ */
+app.get('/admin/details-template.csv', (req, res) => {
+  const sinFoto = getMergedProducts().filter((p) => !p.image);
+  const headers = ['Codigo', 'Nombre', 'Descripcion', 'Imagen', 'Imagen2', 'Imagen3', 'Imagen4', 'Video', 'Material', 'Color', 'Ancho', 'Alto', 'Largo', 'Peso'];
+  const lines = [headers.join(',')];
+  for (const p of sinFoto) {
+    lines.push([csvCell(p.id), csvCell(p.title), '', '', '', '', '', '', '', '', '', '', '', ''].join(','));
+  }
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="productos-sin-foto.csv"');
+  // BOM para que Excel en Windows abra los acentos bien en vez de mostrarlos como "Ã±".
+  res.send('﻿' + lines.join('\r\n'));
+});
+
+/**
+ * Carga masiva de descripciones e imágenes adicionales a product_details.json.
+ *
+ * NO confundir con /admin/upload: ese reemplaza el catálogo CRUDO y la sincronización con PLADE lo
+ * pisa a los 30 minutos. Este escribe en la capa de detalles, que se fusiona al LEER
+ * (mergeProductWithDetails) y por lo tanto sobrevive a toda sincronización.
+ *
+ * Fusiona campo por campo: una celda vacía NO borra lo que ya estaba cargado, y las columnas que no
+ * estén en la planilla ni se tocan. Así se puede subir una planilla solo con descripciones sin
+ * perder las medidas/material que alguien ya cargó a mano desde /admin/products.
+ */
+app.post('/admin/details-upload', upload.single('file'), (req, res) => {
+  if (req.body.password !== ADMIN_PASSWORD) {
+    return res.status(401).send('Contraseña incorrecta. <a href="/admin">Volver</a>');
+  }
+  if (!req.file) {
+    return res.status(400).send('No se recibió ningún archivo. <a href="/admin">Volver</a>');
+  }
+
+  try {
+    const workbook = readWorkbookAutoEncoding(req.file.buffer);
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { defval: '' });
+    if (rows.length === 0) {
+      return res.status(400).send('El archivo no tiene filas de datos. <a href="/admin">Volver</a>');
+    }
+
+    const headers = Object.keys(rows[0]);
+    const columnMap = buildColumnMap(headers, DETAIL_FIELD_SYNONYMS);
+
+    if (!columnMap.sku) {
+      return res.status(400).send(
+        `No se encontró la columna de código de producto. Columnas detectadas: ${escapeHtml(headers.join(', '))}. ` +
+        `Renombra la columna del código a "Codigo" e intenta de nuevo. <a href="/admin">Volver</a>`
+      );
+    }
+
+    const editables = [...DETAIL_TEXT_FIELDS, ...DETAIL_NUMBER_FIELDS].filter((f) => columnMap[f]);
+    if (editables.length === 0) {
+      return res.status(400).send(
+        `La planilla no tiene ninguna columna de datos reconocida (descripcion, imagen2, imagen3, imagen4, video, ` +
+        `material, color, ancho, alto, largo, peso). Columnas detectadas: ${escapeHtml(headers.join(', '))}. ` +
+        `<a href="/admin">Volver</a>`
+      );
+    }
+
+    // Se valida contra el catálogo crudo: un código que no exista ahí no se puede mostrar en la
+    // tienda, así que conviene reportarlo en vez de guardar un detalle huérfano.
+    const knownIds = new Set(loadProducts().map((p) => p.id));
+    const details = loadDetails();
+
+    let actualizados = 0;
+    let camposEscritos = 0;
+    const desconocidos = [];
+
+    for (const row of rows) {
+      const id = String(row[columnMap.sku] ?? '').trim();
+      if (!id) continue;
+      if (!knownIds.has(id)) {
+        if (desconocidos.length < 25) desconocidos.push(id);
+        continue;
+      }
+
+      const entry = { ...(details[id] || {}) };
+      let cambio = false;
+
+      for (const field of DETAIL_TEXT_FIELDS) {
+        if (!columnMap[field]) continue;
+        const value = String(row[columnMap[field]] ?? '').trim();
+        if (!value) continue; // celda vacía = "no tocar", no "borrar"
+        if (entry[field] !== value) cambio = true;
+        entry[field] = value;
+        camposEscritos++;
+      }
+      for (const field of DETAIL_NUMBER_FIELDS) {
+        if (!columnMap[field]) continue;
+        const value = parseOptionalNumber(row[columnMap[field]]);
+        if (value === null) continue;
+        if (entry[field] !== value) cambio = true;
+        entry[field] = value;
+        camposEscritos++;
+      }
+
+      if (cambio) {
+        details[id] = entry;
+        actualizados++;
+      }
+    }
+
+    saveDetails(details);
+
+    const avisoDesconocidos = desconocidos.length
+      ? `<p style="color:#b45309">${desconocidos.length === 25 ? 'Al menos 25' : desconocidos.length} código(s) de la ` +
+        `planilla no existen en el catálogo y se omitieron: ${escapeHtml(desconocidos.join(', '))}` +
+        `${desconocidos.length === 25 ? ' …' : ''}</p>`
+      : '';
+
+    res.send(
+      `<p>Detalles actualizados: <b>${actualizados}</b> producto(s), ${camposEscritos} campo(s) escrito(s).</p>` +
+      `<p>Columnas reconocidas: ${escapeHtml(editables.join(', '))}.</p>` +
+      avisoDesconocidos +
+      `<p>Estos datos se fusionan al leer el catálogo, así que <b>no los pisa la sincronización con PLADE</b>.</p>` +
+      `<a href="/admin">Volver</a>`
+    );
+  } catch (err) {
+    res.status(500).send(`Error procesando el archivo: ${escapeHtml(err.message)}. <a href="/admin">Volver</a>`);
   }
 });
 
