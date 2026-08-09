@@ -11,6 +11,7 @@ const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade } = require('./plade-marketplade-client');
 const adminUsers = require('./admin-users');
+const productImages = require('./product-images');
 const {
   isLoyaltyConfigured,
   getLoyaltyForUser,
@@ -1040,6 +1041,170 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
         : (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
 
     res.json({ user });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// --- Productos desde el panel nuevo: buscar, editar detalles y subir fotos ---
+// Accesible para admin y empleado: cargar fotos y descripciones es justamente el trabajo que se
+// quiere delegar al personal. No toca precios ni stock (eso lo manda PLADE) ni el catálogo crudo:
+// todo va a product_details.json, la capa que sobrevive a las sincronizaciones.
+
+const ADMIN_PRODUCTS_PAGE_SIZE = 60;
+
+app.get('/api/admin/products', requireAdminRole('admin', 'empleado'), (req, res) => {
+  const search = String(req.query.search || '').trim().toLowerCase();
+  const missing = String(req.query.missing || ''); // '', 'photo' o 'description'
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+  let products = getMergedProducts();
+  if (missing === 'photo') products = products.filter((p) => !p.image);
+  if (missing === 'description') products = products.filter((p) => !p.description || !p.description.trim());
+  if (search) {
+    products = products.filter(
+      (p) => p.id.toLowerCase().includes(search) || p.title.toLowerCase().includes(search)
+    );
+  }
+
+  const total = products.length;
+  const page = products.slice(offset, offset + ADMIN_PRODUCTS_PAGE_SIZE).map((p) => ({
+    id: p.id,
+    title: p.title,
+    category: p.category,
+    price: p.price,
+    stock: p.stock,
+    image: p.image || null,
+    photoCount: [p.image, p.image2, p.image3, p.image4].filter(Boolean).length,
+    hasDescription: Boolean(p.description && p.description.trim()),
+  }));
+
+  res.json({ total, offset, pageSize: ADMIN_PRODUCTS_PAGE_SIZE, products: page });
+});
+
+app.get('/api/admin/products/:id', requireAdminRole('admin', 'empleado'), (req, res) => {
+  const product = getMergedProducts().find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
+  res.json({ product });
+});
+
+/** Descripción y especificaciones. Solo se tocan los campos que vengan en el body. */
+app.patch('/api/admin/products/:id/details', requireAdminRole('admin', 'empleado'), (req, res) => {
+  const product = loadProducts().find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
+
+  const details = loadDetails();
+  const entry = { ...(details[product.id] || {}) };
+
+  for (const field of ['description', 'material', 'color', 'video']) {
+    if (req.body[field] === undefined) continue;
+    const value = String(req.body[field] ?? '').trim();
+    // Cadena vacía = borrar ese campo (el usuario limpió el input), a diferencia del importador
+    // masivo, donde una celda vacía significa "no tocar".
+    if (value) entry[field] = value;
+    else delete entry[field];
+  }
+  for (const field of ['width', 'height', 'length', 'weight']) {
+    if (req.body[field] === undefined) continue;
+    const value = parseOptionalNumber(req.body[field]);
+    if (value === null) delete entry[field];
+    else entry[field] = value;
+  }
+
+  details[product.id] = entry;
+  saveDetails(details);
+
+  const merged = getMergedProducts().find((p) => p.id === product.id);
+  res.json({ product: merged });
+});
+
+app.post('/api/admin/products/:id/images', requireAdminRole('admin', 'empleado'), upload.single('file'), async (req, res) => {
+  if (!productImages.isImagesConfigured()) {
+    return res.status(503).json({ error: 'Supabase no está configurado: no se pueden guardar fotos.' });
+  }
+  const product = loadProducts().find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
+  if (!req.file) return res.status(400).json({ error: 'No se recibió ninguna imagen.' });
+
+  const slot = String(req.body.slot || 'image');
+  try {
+    const url = await productImages.uploadProductImage(product.id, slot, req.file.buffer);
+    const details = loadDetails();
+    details[product.id] = { ...(details[product.id] || {}), [slot]: url };
+    saveDetails(details);
+    res.json({ slot, url, product: getMergedProducts().find((p) => p.id === product.id) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// El video es el quinto elemento de la ficha, igual que en PLADE. Va aparte de las fotos porque
+// tiene su propio campo (`video`), su propio límite de tamaño y no se puede comprimir en el
+// navegador como las imágenes. `uploadVideo` es un multer propio: el de las fotos corta en 10MB.
+const uploadVideo = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: productImages.MAX_VIDEO_BYTES },
+});
+
+app.post('/api/admin/products/:id/video', requireAdminRole('admin', 'empleado'), uploadVideo.single('file'), async (req, res) => {
+  if (!productImages.isImagesConfigured()) {
+    return res.status(503).json({ error: 'Supabase no está configurado: no se pueden guardar videos.' });
+  }
+  const product = loadProducts().find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
+  if (!req.file) return res.status(400).json({ error: 'No se recibió ningún video.' });
+
+  try {
+    const url = await productImages.uploadProductVideo(product.id, req.file.buffer);
+    const details = loadDetails();
+    details[product.id] = { ...(details[product.id] || {}), video: url };
+    saveDetails(details);
+    res.json({ url, product: getMergedProducts().find((p) => p.id === product.id) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/products/:id/video', requireAdminRole('admin', 'empleado'), async (req, res) => {
+  if (!productImages.isImagesConfigured()) {
+    return res.status(503).json({ error: 'Supabase no está configurado.' });
+  }
+  const product = loadProducts().find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
+
+  try {
+    await productImages.deleteProductVideo(product.id);
+    const details = loadDetails();
+    if (details[product.id]) {
+      delete details[product.id].video;
+      saveDetails(details);
+    }
+    res.json({ ok: true, product: getMergedProducts().find((p) => p.id === product.id) });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.delete('/api/admin/products/:id/images/:slot', requireAdminRole('admin', 'empleado'), async (req, res) => {
+  if (!productImages.isImagesConfigured()) {
+    return res.status(503).json({ error: 'Supabase no está configurado.' });
+  }
+  const product = loadProducts().find((p) => p.id === req.params.id);
+  if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
+
+  const slot = req.params.slot;
+  if (!productImages.isValidSlot(slot)) return res.status(400).json({ error: 'Slot inválido.' });
+
+  try {
+    await productImages.deleteProductImage(product.id, slot);
+    const details = loadDetails();
+    if (details[product.id]) {
+      // Se borra la clave en vez de dejarla vacía, así mergeProductWithDetails() vuelve a mostrar
+      // lo que traiga PLADE en ese slot (relevante sobre todo para `image`).
+      delete details[product.id][slot];
+      saveDetails(details);
+    }
+    res.json({ ok: true, product: getMergedProducts().find((p) => p.id === product.id) });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
