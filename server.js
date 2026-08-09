@@ -1668,6 +1668,50 @@ app.post('/api/admin/scan', requireAdminRole('admin', 'salidas'), (req, res) => 
   res.json({ ok: true, order: scanOrderSummary(order) });
 });
 
+/**
+ * Compara dos secretos en tiempo constante. Sin esto, el tiempo de respuesta filtra cuántos
+ * caracteres del principio coinciden y la contraseña se puede adivinar carácter por carácter.
+ */
+function secretsMatch(a, b) {
+  const ba = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  // timingSafeEqual exige el mismo largo; comparar el largo aparte no filtra nada útil.
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+/**
+ * Autenticación del panel HTML viejo (todo lo que cuelga de /admin en ESTE backend; el panel nuevo
+ * vive en cristal44.com/admin y usa tokens).
+ *
+ * Por qué existe: hasta el 2026-08-09 este panel solo pedía contraseña en los POST. Los GET estaban
+ * completamente abiertos, así que `GET /admin/purchases` publicaba las ventas reales —fecha, monto,
+ * país— y, peor, el orderId COMPLETO de cada una enlazado a `/api/orders/:id/pdf`. Esos PDFs se
+ * sirven sin credenciales a propósito (el orderId aleatorio es la llave, así el cliente abre su
+ * recibo desde WhatsApp), y contienen nombre, cédula, teléfono y dirección del comprador. O sea que
+ * cualquiera con la URL del backend —que es pública, va en el bundle del frontend— podía recorrer
+ * la tabla y bajarse los datos personales de todos los clientes. Verificado en producción.
+ *
+ * Se usa Basic Auth y no un formulario con sesión porque son páginas HTML servidas de una: el
+ * navegador ya sabe pedir las credenciales y reenviarlas, sin agregar cookies ni estado de sesión.
+ * Solo se valida la contraseña, ignorando el usuario, para no cambiarle el modelo mental a quien ya
+ * usaba este panel ("la contraseña de administración").
+ */
+function requireAdminPage(req, res, next) {
+  const header = req.headers.authorization || '';
+  if (header.startsWith('Basic ')) {
+    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
+    const sep = decoded.indexOf(':');
+    if (sep !== -1 && secretsMatch(decoded.slice(sep + 1), ADMIN_PASSWORD)) return next();
+  }
+  res.set('WWW-Authenticate', 'Basic realm="Panel - El Imperio del Cristal", charset="UTF-8"');
+  res.status(401).send('Acceso restringido. Se necesita la contraseña de administración.');
+}
+
+// Cubre /admin y todo lo que cuelgue de ahí. NO afecta a /api/*: la tienda y el panel nuevo no
+// pasan por acá (el panel nuevo usa /api/admin/* con token, verificado antes de aplicar esto).
+app.use('/admin', requireAdminPage);
+
 app.get('/admin', (req, res) => {
   const products = loadProducts();
   res.send(`<!doctype html>
