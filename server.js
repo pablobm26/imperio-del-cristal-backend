@@ -1046,6 +1046,155 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
   }
 });
 
+// --- Pedidos desde el panel nuevo: listar, ver detalle, despachar y anular ---
+//
+// La fuente de verdad del estado es NUESTRO registro (orders_location.json), no la tabla purchases
+// de Supabase: esa solo existe para clientes logueados que suman fidelidad, y los pedidos de
+// invitados no tienen fila ahí. Al anular se sincroniza purchases si hay una fila que corresponda,
+// pero el stock y el estado se manejan siempre contra nuestro propio registro, que siempre existe.
+
+const ADMIN_ORDERS_PAGE_SIZE = 40;
+
+function orderSummary(order) {
+  return {
+    orderId: order.orderId,
+    createdAt: order.createdAt,
+    nombre: order.nombre || null,
+    telefono: order.telefono || null,
+    total: order.total ?? null,
+    paymentMethod: order.paymentMethod || null,
+    deliveryMethod: order.deliveryMethod || null,
+    destino: [order.ciudad, order.estado].filter(Boolean).join(', ') || null,
+    dispatchedAt: order.dispatchedAt || null,
+    dispatchedBy: order.dispatchedBy || null,
+    cancelledAt: order.cancelledAt || null,
+    cancelledBy: order.cancelledBy || null,
+    hasProof: Boolean(order.proofUrl),
+  };
+}
+
+/** pendiente = ni despachado ni anulado. Es el estado que importa a la salida de la tienda. */
+function orderStatus(order) {
+  if (order.cancelledAt) return 'anulado';
+  if (order.dispatchedAt) return 'despachado';
+  return 'pendiente';
+}
+
+app.get('/api/admin/orders', requireAdminRole('admin', 'empleado'), (req, res) => {
+  const search = String(req.query.search || '').trim().toLowerCase();
+  const status = String(req.query.status || '');
+  const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
+
+  // Más recientes primero: es el orden en que se trabajan los pedidos.
+  let orders = loadOrdersLocation().slice().reverse();
+  if (status) orders = orders.filter((o) => orderStatus(o) === status);
+  if (search) {
+    orders = orders.filter((o) =>
+      [o.orderId, o.nombre, o.telefono, o.cedula, o.reference]
+        .filter(Boolean)
+        .some((v) => String(v).toLowerCase().includes(search))
+    );
+  }
+
+  const counts = loadOrdersLocation().reduce(
+    (acc, o) => {
+      acc[orderStatus(o)]++;
+      return acc;
+    },
+    { pendiente: 0, despachado: 0, anulado: 0 }
+  );
+
+  res.json({
+    total: orders.length,
+    offset,
+    pageSize: ADMIN_ORDERS_PAGE_SIZE,
+    counts,
+    orders: orders.slice(offset, offset + ADMIN_ORDERS_PAGE_SIZE).map(orderSummary),
+  });
+});
+
+app.get('/api/admin/orders/:orderId', requireAdminRole('admin', 'empleado'), (req, res) => {
+  const order = loadOrdersLocation().find((o) => o.orderId === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Pedido no encontrado.' });
+
+  res.json({
+    order: {
+      ...orderSummary(order),
+      status: orderStatus(order),
+      cedula: order.cedula || null,
+      correo: order.correo || null,
+      address: order.address || null,
+      parroquia: order.parroquia || null,
+      pickupStore: order.pickupStore || null,
+      reference: order.reference || null,
+      paymentHolderName: order.paymentHolderName || null,
+      // Los archivos se sirven por sus endpoints públicos existentes, que ya usa el cliente.
+      pdfUrl: `/api/orders/${encodeURIComponent(order.orderId)}/pdf`,
+      proofUrl: order.proofUrl ? `/api/orders/${encodeURIComponent(order.orderId)}/proof` : null,
+      items: Array.isArray(order.items) ? order.items : [],
+      // Los pedidos anteriores a agosto 2026 no guardaban items; conviene decirlo en la pantalla
+      // en vez de mostrar una lista vacía como si la compra no tuviera productos.
+      itemsUnavailable: !Array.isArray(order.items) || order.items.length === 0,
+    },
+  });
+});
+
+/** Marcar despachado a mano, para cuando el código del recibo no se puede escanear. */
+app.post('/api/admin/orders/:orderId/dispatch', requireAdminRole('admin', 'empleado'), (req, res) => {
+  const orders = loadOrdersLocation();
+  const order = orders.find((o) => o.orderId === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Pedido no encontrado.' });
+  if (order.cancelledAt) return res.status(409).json({ error: 'El pedido está anulado; restauralo antes de despacharlo.' });
+  if (order.dispatchedAt) {
+    return res.status(409).json({ error: 'Esta compra ya está procesada y entregada/enviada, no se puede repetir.' });
+  }
+
+  order.dispatchedAt = new Date().toISOString();
+  order.dispatchedBy = req.adminUser.username || req.adminRole;
+  saveOrdersLocation(orders);
+  res.json({ ok: true, order: orderSummary(order) });
+});
+
+/**
+ * Anular o restaurar. Solo rol admin: mueve stock y plata, no es una acción de mostrador.
+ * Anular repone el stock reservado; restaurar lo vuelve a descontar. La guarda de estado evita
+ * duplicar el ajuste si alguien toca el botón dos veces.
+ */
+app.post('/api/admin/orders/:orderId/cancel', requireAdminRole('admin'), async (req, res) => {
+  const restore = req.body?.restore === true;
+  const orders = loadOrdersLocation();
+  const order = orders.find((o) => o.orderId === req.params.orderId);
+  if (!order) return res.status(404).json({ error: 'Pedido no encontrado.' });
+
+  const alreadyCancelled = Boolean(order.cancelledAt);
+  if (restore === alreadyCancelled) {
+    if (restore) {
+      order.cancelledAt = null;
+      order.cancelledBy = null;
+    } else {
+      order.cancelledAt = new Date().toISOString();
+      order.cancelledBy = req.adminUser.username || req.adminRole;
+    }
+    if (Array.isArray(order.items) && order.items.length) {
+      adjustStock(order.items, restore ? -1 : 1);
+    }
+    saveOrdersLocation(orders);
+
+    // Si el pedido tiene una compra registrada para fidelidad, se sincroniza el estado. Que no
+    // exista es normal (compra de invitado) y no debe hacer fallar la anulación.
+    if (isLoyaltyConfigured()) {
+      try {
+        const purchase = (await listPurchases()).find((p) => p.order_id === order.orderId);
+        if (purchase) await setPurchaseStatus(purchase.id, restore ? 'confirmed' : 'cancelled');
+      } catch (err) {
+        console.error(`No se pudo sincronizar purchases para ${order.orderId}:`, err.message);
+      }
+    }
+  }
+
+  res.json({ ok: true, order: { ...orderSummary(order), status: orderStatus(order) } });
+});
+
 // --- Productos desde el panel nuevo: buscar, editar detalles y subir fotos ---
 // Accesible para admin y empleado: cargar fotos y descripciones es justamente el trabajo que se
 // quiere delegar al personal. No toca precios ni stock (eso lo manda PLADE) ni el catálogo crudo:
