@@ -985,7 +985,15 @@ async function authenticateAdmin(username, password) {
   // cuando Supabase falla: se le da rol `master` para que nunca quede por debajo de una cuenta de
   // la base. Además garantiza que SIEMPRE exista un master que pueda crear otros.
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-    return { role: 'master', sub: null, username: ADMIN_USERNAME, fullName: 'Dueño', canViewCounter: true };
+    // El nombre se muestra en el saludo del panel y en la cabecera. El panel toma el primer
+    // término para el "Hola, ..." — por eso el nombre va primero y el cargo entre paréntesis.
+    return {
+      role: 'master',
+      sub: null,
+      username: ADMIN_USERNAME,
+      fullName: 'Giormary Pacia (C.E.O.)',
+      canViewCounter: true,
+    };
   }
   if (username === SALIDAS_USERNAME && password === SALIDAS_PASSWORD) {
     return { role: 'salidas', sub: null, username: SALIDAS_USERNAME, fullName: 'Salidas' };
@@ -1302,6 +1310,13 @@ function calcularContador() {
     const t = new Date(o.dispatchedAt || 0).getTime();
     return Number.isFinite(t) && t >= desde && !o.cancelledAt;
   });
+  // Anuladas: se mide por la fecha en que se ANULÓ, no por la de la venta. Anular hoy un pedido de
+  // la semana pasada es trabajo de hoy, y es lo que el dueño quiere ver en el contador del día.
+  const anuladasHoy = orders.filter((o) => {
+    const t = new Date(o.cancelledAt || 0).getTime();
+    return Number.isFinite(t) && t >= desde;
+  });
+  const porDespachar = orders.filter((o) => !o.cancelledAt && !o.dispatchedAt);
 
   const usd = deHoy.reduce((s, o) => s + (typeof o.total === 'number' ? o.total : 0), 0);
   const rate = bcvRateCache && bcvRateCache.rate ? bcvRateCache.rate : null;
@@ -1309,6 +1324,12 @@ function calcularContador() {
   return {
     ventas: deHoy.length,
     despachados: despachadosHoy.length,
+    anuladas: anuladasHoy.length,
+    // Del día, para que el contador sea coherente con el resto de la barra…
+    porDespacharHoy: porDespachar.filter((o) => new Date(o.createdAt).getTime() >= desde).length,
+    // …y el total acumulado, porque un pedido de ayer sin despachar sigue siendo trabajo pendiente
+    // y desaparecería del radar si solo se mirara el día.
+    porDespacharTotal: porDespachar.length,
     usd,
     // Sin tasa en caché se devuelve null en vez de un 0 que parecería una venta de cero bolívares.
     bs: rate ? Math.round(usd * rate * 100) / 100 : null,
@@ -1645,7 +1666,7 @@ app.post('/api/admin/orders/:orderId/cancel', requireAdminRole('admin'), async (
 
 const ADMIN_PRODUCTS_PAGE_SIZE = 30;
 
-app.get('/api/admin/products', requireAdminRole('admin', 'empleado'), (req, res) => {
+app.get('/api/admin/products', requireAdminRole('admin'), (req, res) => {
   const search = String(req.query.search || '').trim().toLowerCase();
   const missing = String(req.query.missing || ''); // '', 'photo' o 'description'
   const offset = Math.max(0, parseInt(req.query.offset, 10) || 0);
@@ -1689,14 +1710,14 @@ app.get('/api/admin/products', requireAdminRole('admin', 'empleado'), (req, res)
   res.json({ total, offset, pageSize: ADMIN_PRODUCTS_PAGE_SIZE, categories, products: page });
 });
 
-app.get('/api/admin/products/:id', requireAdminRole('admin', 'empleado'), (req, res) => {
+app.get('/api/admin/products/:id', requireAdminRole('admin'), (req, res) => {
   const product = getMergedProducts().find((p) => p.id === req.params.id);
   if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
   res.json({ product });
 });
 
 /** Descripción y especificaciones. Solo se tocan los campos que vengan en el body. */
-app.patch('/api/admin/products/:id/details', requireAdminRole('admin', 'empleado'), (req, res) => {
+app.patch('/api/admin/products/:id/details', requireAdminRole('admin'), (req, res) => {
   const product = loadProducts().find((p) => p.id === req.params.id);
   if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
 
@@ -1725,7 +1746,7 @@ app.patch('/api/admin/products/:id/details', requireAdminRole('admin', 'empleado
   res.json({ product: merged });
 });
 
-app.post('/api/admin/products/:id/images', requireAdminRole('admin', 'empleado'), upload.single('file'), async (req, res) => {
+app.post('/api/admin/products/:id/images', requireAdminRole('admin'), upload.single('file'), async (req, res) => {
   if (!productImages.isImagesConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado: no se pueden guardar fotos.' });
   }
@@ -1753,7 +1774,7 @@ const uploadVideo = multer({
   limits: { fileSize: productImages.MAX_VIDEO_BYTES },
 });
 
-app.post('/api/admin/products/:id/video', requireAdminRole('admin', 'empleado'), uploadVideo.single('file'), async (req, res) => {
+app.post('/api/admin/products/:id/video', requireAdminRole('admin'), uploadVideo.single('file'), async (req, res) => {
   if (!productImages.isImagesConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado: no se pueden guardar videos.' });
   }
@@ -1772,7 +1793,7 @@ app.post('/api/admin/products/:id/video', requireAdminRole('admin', 'empleado'),
   }
 });
 
-app.delete('/api/admin/products/:id/video', requireAdminRole('admin', 'empleado'), async (req, res) => {
+app.delete('/api/admin/products/:id/video', requireAdminRole('admin'), async (req, res) => {
   if (!productImages.isImagesConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado.' });
   }
@@ -1792,7 +1813,7 @@ app.delete('/api/admin/products/:id/video', requireAdminRole('admin', 'empleado'
   }
 });
 
-app.delete('/api/admin/products/:id/images/:slot', requireAdminRole('admin', 'empleado'), async (req, res) => {
+app.delete('/api/admin/products/:id/images/:slot', requireAdminRole('admin'), async (req, res) => {
   if (!productImages.isImagesConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado.' });
   }
@@ -1838,7 +1859,7 @@ function scanOrderSummary(order) {
 // arriba) a la salida de la tienda: confirma los datos del pedido y lo marca como despachado — una
 // sola vez. Si ya se había escaneado antes, NO lo vuelve a marcar y avisa que ya se procesó, para
 // que la misma compra no pueda "salir" dos veces.
-app.post('/api/admin/scan', requireAdminRole('admin', 'salidas'), (req, res) => {
+app.post('/api/admin/scan', requireAdminRole('admin', 'salidas', 'empleado'), (req, res) => {
   const code = String(req.body?.code || '').trim();
   if (!code) return res.status(400).json({ error: 'Falta el código escaneado.' });
 
