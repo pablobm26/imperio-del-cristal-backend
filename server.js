@@ -1321,6 +1321,21 @@ function calcularContador() {
   const usd = deHoy.reduce((s, o) => s + (typeof o.total === 'number' ? o.total : 0), 0);
   const rate = bcvRateCache && bcvRateCache.rate ? bcvRateCache.rate : null;
 
+  // Desglose por forma de pago, para el submenú del botón Valor. Se manda la CLAVE cruda
+  // (pagoMovil, zelle…) y no una etiqueta: los nombres legibles ya viven en el frontend
+  // (lib/payment-methods.ts) y duplicarlos acá sería una segunda lista que se desincroniza.
+  const porMetodo = new Map();
+  for (const o of deHoy) {
+    const metodo = o.paymentMethod || 'desconocido';
+    const acc = porMetodo.get(metodo) || { metodo, pedidos: 0, usd: 0 };
+    acc.pedidos++;
+    acc.usd += typeof o.total === 'number' ? o.total : 0;
+    porMetodo.set(metodo, acc);
+  }
+  const porMetodoPago = [...porMetodo.values()]
+    .map((m) => ({ ...m, usd: Math.round(m.usd * 100) / 100 }))
+    .sort((a, b) => b.usd - a.usd || b.pedidos - a.pedidos);
+
   return {
     ventas: deHoy.length,
     despachados: despachadosHoy.length,
@@ -1331,6 +1346,7 @@ function calcularContador() {
     // y desaparecería del radar si solo se mirara el día.
     porDespacharTotal: porDespachar.length,
     usd,
+    porMetodoPago,
     // Sin tasa en caché se devuelve null en vez de un 0 que parecería una venta de cero bolívares.
     bs: rate ? Math.round(usd * rate * 100) / 100 : null,
     bcvRate: rate,
