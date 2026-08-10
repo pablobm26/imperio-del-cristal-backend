@@ -1859,6 +1859,34 @@ function scanOrderSummary(order) {
 // arriba) a la salida de la tienda: confirma los datos del pedido y lo marca como despachado — una
 // sola vez. Si ya se había escaneado antes, NO lo vuelve a marcar y avisa que ya se procesó, para
 // que la misma compra no pueda "salir" dos veces.
+/**
+ * Marcador de la pantalla de escaneo: cuántas salidas se hicieron hoy y cuántas quedan.
+ *
+ * Endpoint aparte de /api/admin/counter a propósito: ese es solo para master/admin autorizados
+ * porque incluye montos, y quien está en la puerta tiene rol `salidas`. Acá no viaja ninguna cifra
+ * de dinero, solo conteos operativos — se puede abrir a todos los que escanean.
+ */
+app.get('/api/admin/scan/stats', requireAdminRole('admin', 'salidas', 'empleado'), (req, res) => {
+  const desde = startOfTodayVenezuela();
+  const orders = loadOrdersLocation();
+
+  const hechasHoy = orders.filter((o) => {
+    const t = new Date(o.dispatchedAt || 0).getTime();
+    return Number.isFinite(t) && t >= desde && !o.cancelledAt;
+  }).length;
+
+  const pendientes = orders.filter((o) => !o.cancelledAt && !o.dispatchedAt);
+
+  res.json({
+    hechasHoy,
+    // Faltantes = todo lo que no salió, de cualquier fecha: un pedido de ayer que el cliente no
+    // retiró sigue esperando en la puerta. El de hoy va aparte, como referencia.
+    faltantes: pendientes.length,
+    faltantesDeHoy: pendientes.filter((o) => new Date(o.createdAt).getTime() >= desde).length,
+    desde: new Date(desde).toISOString(),
+  });
+});
+
 app.post('/api/admin/scan', requireAdminRole('admin', 'salidas', 'empleado'), (req, res) => {
   const code = String(req.body?.code || '').trim();
   if (!code) return res.status(400).json({ error: 'Falta el código escaneado.' });
