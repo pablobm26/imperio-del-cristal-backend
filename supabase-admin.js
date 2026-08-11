@@ -39,6 +39,47 @@ async function getLoyaltyForUser(userId) {
 }
 
 /**
+ * Se cumple cuando la función RPC todavía no existe en la base — es decir, cuando la migración
+ * correspondiente no se corrió. Las migraciones las corre el dueño a mano y el deploy puede llegar
+ * antes: sin este chequeo, una pantalla nueva devolvería 500 en vez de decir qué falta. Mismo
+ * espíritu que isMissingColumn() en admin-users.js, escrito tras el incidente del 2026-08-09.
+ * PostgREST responde PGRST202 si el RPC no está en el esquema expuesto; Postgres, 42883.
+ */
+function isMissingFunction(error) {
+  return Boolean(error) && (error.code === 'PGRST202' || error.code === '42883');
+}
+
+/**
+ * Nivel de fidelidad de TODOS los clientes de una vez, para la pantalla "Niveles de clientes" del
+ * panel (ver supabase/012_admin_loyalty_levels.sql). Un solo viaje a la base: agrupar por usuario
+ * llamando a getLoyaltyForUser() en un bucle sería una consulta por cliente.
+ *
+ * Los umbrales NO se recalculan acá. Viven en _loyalty_tier_for (supabase/003) y la función los
+ * reusa, así ajustar un umbral sigue siendo editar un solo archivo SQL.
+ *
+ * Devuelve null si falta la migración, para que quien llame lo distinga de "no hay clientes".
+ */
+async function listLoyaltyLevels() {
+  if (!supabaseAdmin) return [];
+  const { data, error } = await supabaseAdmin.rpc('admin_loyalty_levels');
+  if (isMissingFunction(error)) return null;
+  if (error) throw new Error(`Supabase admin_loyalty_levels: ${error.message}`);
+  return (data || []).map((r) => ({
+    userId: r.user_id,
+    fullName: r.full_name,
+    email: r.email,
+    registeredAt: r.registered_at,
+    spend12mo: Number(r.spend_12mo),
+    orders12mo: Number(r.orders_12mo),
+    lastPurchaseAt: r.last_purchase_at,
+    tier: r.tier,
+    discountPercent: Number(r.discount_percent),
+    nextTier: r.next_tier,
+    amountToNext: r.amount_to_next === null ? null : Number(r.amount_to_next),
+  }));
+}
+
+/**
  * Registra una compra que cuenta para el nivel de fidelidad. Best-effort: quien llame a esto debe
  * atrapar el error y no bloquear la respuesta del checkout si falla, mismo espíritu que
  * submitOrderToPlade() en server.js.
@@ -94,6 +135,7 @@ module.exports = {
   supabaseAdmin,
   isLoyaltyConfigured,
   getLoyaltyForUser,
+  listLoyaltyLevels,
   recordPurchase,
   listPurchases,
   getPurchase,

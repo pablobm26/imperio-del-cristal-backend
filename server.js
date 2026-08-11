@@ -15,6 +15,7 @@ const productImages = require('./product-images');
 const {
   isLoyaltyConfigured,
   getLoyaltyForUser,
+  listLoyaltyLevels,
   recordPurchase,
   listPurchases,
   getPurchase,
@@ -1430,6 +1431,91 @@ app.get('/api/admin/counter/stream', requireAdminRole('master', 'admin'), (req, 
     clearInterval(latido);
     clientesContador.delete(res);
   });
+});
+
+// --- Niveles de fidelidad de los clientes ---
+//
+// Comparte el permiso del contador de ventas (can_view_counter) A PROPÓSITO: las dos pantallas
+// muestran cifras de dinero por cliente, así que quien puede ver una puede ver la otra. Evita
+// además una columna nueva en admin_users, que sería una migración sobre la consulta del login —
+// justo lo que devolvió 500 y bloqueó el panel entero el 2026-08-09 (ver HANDOFF.md §6).
+//
+// El tiempo real NO abre un stream propio: la pantalla se cuelga del /api/admin/counter/stream que
+// ya existe y vuelve a pedir estos datos cuando llega un evento. broadcastContador() ya se dispara
+// en los 4 momentos que mueven una venta, así que un segundo canal sería otra conexión abierta por
+// cada panel para enterarse exactamente de lo mismo.
+//
+// El agregado lo resuelve Postgres de una sola llamada (admin_loyalty_levels, supabase/012). Si esa
+// migración todavía no se corrió, listLoyaltyLevels() devuelve null y acá se responde 200 con
+// `migracionPendiente` en vez de un 500 que dejaría la pantalla en blanco sin decir qué falta.
+
+/** De mayor a menor: fija tanto el orden de la respuesta como el de los botones del panel. */
+const NIVELES_FIDELIDAD = ['DIAMANTE', 'PLATINO', 'ORO', 'PLATA', 'NINGUNO'];
+
+function resumirNiveles(clientes) {
+  return NIVELES_FIDELIDAD.map((tier) => {
+    const delNivel = clientes.filter((c) => c.tier === tier);
+    return {
+      tier,
+      clientes: delNivel.length,
+      gasto12mo: Math.round(delNivel.reduce((s, c) => s + c.spend12mo, 0) * 100) / 100,
+      // El descuento es propiedad del nivel, así que alcanza con leerlo de cualquier integrante.
+      // Queda null en un nivel vacío: preferible a repetir acá los porcentajes del 003.
+      descuento: delNivel.length > 0 ? delNivel[0].discountPercent : null,
+    };
+  });
+}
+
+function rechazarSinPermisoDeNiveles(req, res) {
+  if (puedeVerContador(req)) return false;
+  res.status(403).json({ error: 'Tu cuenta no tiene autorizado ver los niveles de clientes.' });
+  return true;
+}
+
+app.get('/api/admin/loyalty/levels', requireAdminRole('master', 'admin'), async (req, res) => {
+  if (rechazarSinPermisoDeNiveles(req, res)) return;
+  if (!isLoyaltyConfigured()) {
+    return res.json({ configurado: false, migracionPendiente: false, niveles: [], totalClientes: 0 });
+  }
+  try {
+    const clientes = await listLoyaltyLevels();
+    if (clientes === null) {
+      return res.json({ configurado: true, migracionPendiente: true, niveles: [], totalClientes: 0 });
+    }
+    res.json({
+      configurado: true,
+      migracionPendiente: false,
+      niveles: resumirNiveles(clientes),
+      totalClientes: clientes.length,
+    });
+  } catch (err) {
+    console.error('No se pudieron cargar los niveles de fidelidad:', err.message);
+    res.status(500).json({ error: 'No se pudieron cargar los niveles de fidelidad.' });
+  }
+});
+
+app.get('/api/admin/loyalty/levels/:tier', requireAdminRole('master', 'admin'), async (req, res) => {
+  if (rechazarSinPermisoDeNiveles(req, res)) return;
+
+  const tier = String(req.params.tier || '').toUpperCase();
+  if (!NIVELES_FIDELIDAD.includes(tier)) {
+    return res.status(404).json({ error: 'Ese nivel no existe.' });
+  }
+  if (!isLoyaltyConfigured()) {
+    return res.json({ configurado: false, migracionPendiente: false, tier, clientes: [] });
+  }
+  try {
+    const todos = await listLoyaltyLevels();
+    if (todos === null) {
+      return res.json({ configurado: true, migracionPendiente: true, tier, clientes: [] });
+    }
+    // De mayor a menor gasto: lo primero que se quiere ver de un nivel es quién más compra.
+    const clientes = todos.filter((c) => c.tier === tier).sort((a, b) => b.spend12mo - a.spend12mo);
+    res.json({ configurado: true, migracionPendiente: false, tier, clientes });
+  } catch (err) {
+    console.error('No se pudieron cargar los clientes del nivel:', err.message);
+    res.status(500).json({ error: 'No se pudieron cargar los clientes de ese nivel.' });
+  }
 });
 
 // --- Dashboard del panel nuevo ---
