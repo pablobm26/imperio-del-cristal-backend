@@ -1528,11 +1528,19 @@ app.get('/api/admin/loyalty/levels/:tier', requireAdminRole('master', 'admin'), 
 /** Umbral de "poco stock". Mismo criterio que el rail de "últimas piezas" del checkout. */
 const LOW_STOCK_THRESHOLD = 5;
 
+/**
+ * Medianoche de hace N días **en Venezuela**.
+ *
+ * Antes usaba `setHours(0,0,0,0)`, que trunca el día en la hora del SERVIDOR — y Render corre en
+ * UTC. O sea que para el Resumen "hoy" empezaba a las 8 de la noche hora local del día anterior,
+ * mientras el contador de ventas (startOfTodayVenezuela) cortaba bien: **las dos pantallas
+ * mostraban días distintos entre las 20:00 y la medianoche**, justo cuando el dueño revisa la
+ * jornada. Se reutiliza la función correcta en vez de repetir el cálculo.
+ *
+ * Restar días de 24 h exactas es válido acá: Venezuela no tiene horario de verano.
+ */
 function startOfDaysAgo(days) {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  d.setDate(d.getDate() - days);
-  return d.getTime();
+  return startOfTodayVenezuela() - days * 24 * 3600_000;
 }
 
 app.get('/api/admin/dashboard', requireAdminRole('admin', 'empleado'), (req, res) => {
