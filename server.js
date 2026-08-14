@@ -33,8 +33,28 @@ const uploadPaymentProof = multer({
   fileFilter: (req, file, cb) => cb(null, /^image\//.test(file.mimetype)),
 });
 
-// Allow the Flutter web build (served from a different origin/port) to call the API.
+// Render termina el TLS y pasa la IP real del visitante en X-Forwarded-For. Sin esto `req.ip`
+// devuelve la IP del proxy para TODO el mundo, y cualquier límite por IP castigaría a todos por
+// igual — incluido el dueño. Un solo salto de confianza, que es exactamente lo que hay delante.
+app.set('trust proxy', 1);
+
+// El catálogo y las fichas son públicos y los consume la tienda desde otro dominio, así que ahí
+// CORS abierto es correcto.
 app.use('/api', cors());
+
+// Pero el panel NO. Antes `app.use('/api', cors())` también dejaba a cualquier página del mundo
+// llamar a /api/admin/* desde el navegador de un administrador logueado. Hoy no era explotable
+// —el token va en una cabecera Authorization que el navegador no adjunta solo, así que no hay
+// CSRF— pero es permiso regalado sin ninguna razón. Se restringe a los orígenes propios.
+const ORIGENES_PANEL = [
+  'https://cristal44.com',
+  'https://www.cristal44.com',
+  'http://localhost:3001', // desarrollo
+];
+app.use('/api/admin', cors({
+  origin: (origin, cb) => cb(null, !origin || ORIGENES_PANEL.includes(origin)),
+  credentials: false,
+}));
 
 // Si DATA_DIR apunta a un disco persistente de Render (ver README), los datos sobreviven a los
 // redeploys. Sin esa variable, cae de vuelta a la carpeta local del repo (efímera en Render free).
@@ -1002,11 +1022,60 @@ async function authenticateAdmin(username, password) {
   return null;
 }
 
+/**
+ * Freno de fuerza bruta para el login del panel.
+ *
+ * NO bloquea de forma permanente, A PROPÓSITO. Un bloqueo duro por IP es un arma de doble filo:
+ * cualquiera puede dispararlo a mano contra la IP del dueño y dejarlo afuera de su propio panel,
+ * que es peor que el ataque que evita. En vez de eso cada intento fallido consecutivo obliga a
+ * esperar el doble que el anterior (0,2s · 0,4s · 0,8s… hasta 5s), lo que vuelve impracticable
+ * probar contraseñas —a 5 segundos por intento son unos 17.000 al día, contra un espacio de
+ * millones— sin molestar a quien simplemente se equivocó al teclear.
+ *
+ * El contador se borra con un login correcto y se olvida solo a los 15 minutos.
+ */
+const VENTANA_LOGIN_MS = 15 * 60 * 1000;
+const ESPERA_MAX_MS = 5000;
+const FALLOS_PARA_RECHAZAR = 25;
+const intentosLogin = new Map();
+
+function podarIntentos() {
+  // Se poda al escribir y no con un temporizador: sin esto el mapa crece sin techo con cada IP
+  // que pase por acá, que es una fuga de memoria lenta pero segura.
+  if (intentosLogin.size < 500) return;
+  const limite = Date.now() - VENTANA_LOGIN_MS;
+  for (const [ip, reg] of intentosLogin) {
+    if (reg.ultimo < limite) intentosLogin.delete(ip);
+  }
+}
+
+function estadoIntentos(ip) {
+  const reg = intentosLogin.get(ip);
+  if (!reg || Date.now() - reg.ultimo > VENTANA_LOGIN_MS) return { fallos: 0, espera: 0 };
+  return { fallos: reg.fallos, espera: Math.min(200 * 2 ** (reg.fallos - 1), ESPERA_MAX_MS) };
+}
+
+function anotarFallo(ip) {
+  const previo = estadoIntentos(ip).fallos;
+  intentosLogin.set(ip, { fallos: previo + 1, ultimo: Date.now() });
+  podarIntentos();
+}
+
 app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ error: 'Falta usuario o contraseña.' });
   }
+
+  const ip = req.ip || 'desconocida';
+  const { fallos, espera } = estadoIntentos(ip);
+  if (fallos >= FALLOS_PARA_RECHAZAR) {
+    res.set('Retry-After', String(Math.ceil(VENTANA_LOGIN_MS / 1000)));
+    return res.status(429).json({ error: 'Demasiados intentos. Espera unos minutos e intenta de nuevo.' });
+  }
+  // La espera va ANTES de validar: así el atacante paga el tiempo aunque acierte, y no se puede
+  // medir por la duración de la respuesta si el usuario existe o no.
+  if (espera > 0) await new Promise((r) => setTimeout(r, espera));
 
   let account;
   try {
@@ -1018,7 +1087,14 @@ app.post('/api/admin/login', async (req, res) => {
     return res.status(500).json({ error: 'No se pudo validar el acceso. Intentá de nuevo.' });
   }
 
-  if (!account) return res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+  if (!account) {
+    anotarFallo(ip);
+    return res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
+  }
+
+  // Entró bien: se borra el historial de fallos de esa IP para que un error de tecleo previo no
+  // le siga cobrando espera al dueño el resto del cuarto de hora.
+  intentosLogin.delete(ip);
 
   res.json({
     token: signAdminToken(account.role, {
@@ -2155,7 +2231,7 @@ app.get('/admin', (req, res) => {
   ${products.length ? `
   <table>
     <tr><th>ID</th><th>Nombre</th><th>Precio</th><th>Stock</th><th>Categoría</th></tr>
-    ${products.slice(0, 20).map(p => `<tr><td>${p.id}</td><td>${p.title}</td><td>$${p.price.toFixed(2)}</td><td>${p.stock ?? '-'}</td><td>${p.category}</td></tr>`).join('')}
+    ${products.slice(0, 20).map(p => `<tr><td>${escapeHtml(p.id)}</td><td>${escapeHtml(p.title)}</td><td>$${p.price.toFixed(2)}</td><td>${p.stock ?? '-'}</td><td>${escapeHtml(p.category)}</td></tr>`).join('')}
   </table>
   ${products.length > 20 ? `<p>... y ${products.length - 20} más.</p>` : ''}
   ` : ''}
