@@ -1,4 +1,20 @@
 node_modules/
-data/products.json
-data/product_details.json
 .env
+
+# TODA la carpeta data/, no archivo por archivo.
+#
+# ESTE REPOSITORIO ES PÚBLICO. Acá dentro viven datos personales de clientes reales:
+#   customers.json            nombre, cédula, correo y teléfono
+#   orders_location.json      los pedidos con su ubicación de entrega
+#   orders_pdfs/              comprobantes con nombre, cédula, teléfono y dirección
+#   orders_payment_proofs/    capturas de pago que suben los clientes
+#   orders_receipts/          comprobantes para pantalla, con la captura del pago incrustada
+#
+# Antes solo se ignoraban products.json y product_details.json, así que un `git add -A` habría
+# publicado todo lo demás en GitHub — y lo que se sube a un repo público queda en el historial
+# aunque después se borre. La regla "nunca usar git add -A" dependía de que nadie se olvidara;
+# esto no depende de nadie.
+data/
+
+# El catálogo y los detalles se regeneran solos desde PLADE, no hace falta versionarlos.
+!data/.gitkeep
