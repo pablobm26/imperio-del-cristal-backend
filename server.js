@@ -40,7 +40,17 @@ app.set('trust proxy', 1);
 
 // El catálogo y las fichas son públicos y los consume la tienda desde otro dominio, así que ahí
 // CORS abierto es correcto.
-app.use('/api', cors());
+//
+// SALTEA /api/admin A PROPÓSITO. La primera versión de este arreglo dejaba este `cors()` cubriendo
+// todo /api y añadía después una política restrictiva para el panel — y no servía de nada: cuando
+// el origen NO está permitido, el middleware de abajo no escribe ninguna cabecera, así que
+// sobrevivía el `Access-Control-Allow-Origin: *` que este ya había puesto. Verificado contra
+// producción: un origen ajeno seguía recibiendo `*`.
+const corsPublico = cors();
+app.use('/api', (req, res, next) => {
+  if (req.path === '/admin' || req.path.startsWith('/admin/')) return next();
+  return corsPublico(req, res, next);
+});
 
 // Pero el panel NO. Antes `app.use('/api', cors())` también dejaba a cualquier página del mundo
 // llamar a /api/admin/* desde el navegador de un administrador logueado. Hoy no era explotable
