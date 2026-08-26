@@ -33,6 +33,18 @@ const uploadPaymentProof = multer({
   fileFilter: (req, file, cb) => cb(null, /^image\//.test(file.mimetype)),
 });
 
+// El backend sirve archivos subidos por clientes (capturas de pago) y HTML del panel viejo, y no
+// mandaba ninguna cabecera de seguridad — esas están puestas en Vercel, que solo cubre la tienda.
+// `nosniff` impide que el navegador "adivine" el tipo de un archivo y termine ejecutando como
+// página algo que se sirvió como imagen; el resto niega que este dominio se pueda meter en un
+// iframe ajeno y evita filtrar el orderId (que ES la llave del comprobante) por el Referer.
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'SAMEORIGIN');
+  res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
 // Render termina el TLS y pasa la IP real del visitante en X-Forwarded-For. Sin esto `req.ip`
 // devuelve la IP del proxy para TODO el mundo, y cualquier límite por IP castigaría a todos por
 // igual — incluido el dueño. Un solo salto de confianza, que es exactamente lo que hay delante.
@@ -2779,8 +2791,17 @@ app.post('/api/orders', (req, res) => {
 
   let proofUrl = null;
   if (req.file) {
-    const ext = req.file.mimetype === 'image/png' ? '.png' : req.file.mimetype === 'image/webp' ? '.webp' : '.jpg';
-    fs.writeFileSync(path.join(ORDERS_PAYMENT_PROOFS_DIR, `${orderId}${ext}`), req.file.buffer);
+    // Se mira lo que el archivo ES, no lo que dice ser. Antes la extensión se elegía a partir de
+    // `req.file.mimetype` —el Content-Type que declara el navegador, que se falsifica con un clic—
+    // y los bytes no se revisaban nunca. O sea que este endpoint, que es PÚBLICO y no pide sesión,
+    // aceptaba cualquier archivo con solo decir que era una imagen, y después lo servía desde el
+    // dominio del backend. Las fotos de producto del panel ya se validaban así desde el principio;
+    // la captura de pago se había quedado atrás, justo la que más lo necesita por ser abierta.
+    const tipo = productImages.detectImageType(req.file.buffer);
+    if (!tipo) {
+      return res.status(400).json({ error: 'La captura del pago no es una imagen válida (solo JPG, PNG o WebP).' });
+    }
+    fs.writeFileSync(path.join(ORDERS_PAYMENT_PROOFS_DIR, `${orderId}.${tipo.ext}`), req.file.buffer);
     proofUrl = `/api/orders/${orderId}/proof`;
   }
 
