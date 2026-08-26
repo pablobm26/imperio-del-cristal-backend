@@ -1918,10 +1918,74 @@ app.get('/api/admin/products', requireAdminRole('admin'), (req, res) => {
   res.json({ total, offset, pageSize: ADMIN_PRODUCTS_PAGE_SIZE, categories, products: page });
 });
 
+/**
+ * Vista previa: NO modifica nada. Se mira antes de borrar, para que quede claro qué se va a tocar.
+ */
+app.get('/api/admin/products/demo-media', requireAdminRole('admin'), (req, res) => {
+  const details = loadDetails();
+  const catalogo = new Map(loadProducts().map((p) => [p.id, p]));
+
+  const afectados = Object.entries(details)
+    .map(([id, entry]) => ({ id, campos: mediaDePrueba(entry) }))
+    .filter((x) => x.campos.length > 0)
+    .map((x) => ({
+      id: x.id,
+      title: catalogo.get(x.id)?.title ?? '(no está en el catálogo)',
+      campos: x.campos,
+      urls: x.campos.map((c) => details[x.id][c]),
+    }));
+
+  res.json({ total: afectados.length, productos: afectados });
+});
+
 app.get('/api/admin/products/:id', requireAdminRole('admin'), (req, res) => {
   const product = getMergedProducts().find((p) => p.id === req.params.id);
   if (!product) return res.status(404).json({ error: 'Producto no encontrado.' });
   res.json({ product });
+});
+
+// --- Limpieza del material de prueba que quedó en el catálogo ---
+//
+// El 2026-08-16 se detectaron 12 productos en producción mostrando a los clientes fotos de banco de
+// imágenes (images.pexels.com) y el mismo video de ejemplo de W3Schools. Quedaron de pruebas
+// anteriores; viven en product_details.json, que está en el disco de Render y por eso no se ve en
+// el repo.
+//
+// SOLO borra lo que coincide con estos dominios. Una foto real subida desde el panel vive en
+// Supabase Storage y no matchea, así que no hay forma de que este endpoint borre trabajo bueno.
+// Si algún día se usa Pexels a propósito, sacarlo de la lista ANTES de correr esto.
+const DOMINIOS_DE_PRUEBA = /(^|\/\/|\.)(pexels\.com|w3schools\.com)\//i;
+const CAMPOS_MEDIA = ['image', 'image2', 'image3', 'image4', 'video'];
+
+/** Devuelve qué campos de un producto apuntan a material de prueba. */
+function mediaDePrueba(entry) {
+  if (!entry) return [];
+  return CAMPOS_MEDIA.filter((c) => entry[c] && DOMINIOS_DE_PRUEBA.test(String(entry[c])));
+}
+
+/**
+ * Borra los campos de media que apuntan a los dominios de prueba. El resto de la ficha —material,
+ * color, medidas, peso, descripción— **no se toca**: son datos cargados a mano que cuestan trabajo.
+ * Al quedar el campo vacío, `mergeProductWithDetails` deja de sobreescribir y el producto vuelve a
+ * mostrar la foto que venga de PLADE (o ninguna, si PLADE no tiene).
+ */
+app.post('/api/admin/products/demo-media/clean', requireAdminRole('admin'), (req, res) => {
+  const details = loadDetails();
+  const limpiados = [];
+
+  for (const [id, entry] of Object.entries(details)) {
+    const campos = mediaDePrueba(entry);
+    if (campos.length === 0) continue;
+    for (const c of campos) delete entry[c];
+    // Si la ficha se queda sin nada, se saca del archivo en vez de dejar un objeto vacío.
+    if (Object.keys(entry).length === 0) delete details[id];
+    else details[id] = entry;
+    limpiados.push({ id, campos });
+  }
+
+  if (limpiados.length > 0) saveDetails(details);
+  console.log(`Limpieza de material de prueba: ${limpiados.length} productos afectados.`);
+  res.json({ limpiados: limpiados.length, productos: limpiados });
 });
 
 /** Descripción y especificaciones. Solo se tocan los campos que vengan en el body. */
