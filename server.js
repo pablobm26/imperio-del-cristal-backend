@@ -2710,20 +2710,54 @@ app.post('/api/orders', (req, res) => {
     return res.status(400).json({ error: 'Falta la captura del pago.' });
   }
 
-  const normalizedItems = items.map((item) => ({
-    id: String(item?.id ?? '').trim() || '—',
-    title: String(item?.title ?? '').trim() || 'Producto',
-    quantity: Math.max(1, Math.trunc(Number(item?.quantity) || 1)),
-    price: Number(item?.price) || 0,
-  }));
+  // EL PRECIO Y EL NOMBRE SE TOMAN DEL CATÁLOGO, NO DE LO QUE MANDÓ EL NAVEGADOR.
+  //
+  // Antes era `price: Number(item?.price) || 0` — el precio venía del cliente y nadie lo
+  // contrastaba. Eso permitía dos abusos con una petición hecha a mano:
+  //   1. Declarar un precio de 0,01 y llevarse mercancía real: el comprobante, el descuento de
+  //      stock y la factura que va a PLADE quedaban todos con ese precio inventado.
+  //   2. Al revés, declarar una compra enorme para que `recordPurchase` escriba ese monto en
+  //      `purchases` y saltar a nivel DIAMANTE — 20% de descuento permanente sin pagar nada.
+  //      (Se limita solo porque anular el pedido después lo saca del cálculo, ver migración 004.)
+  //
+  // La tienda muestra `product.price` sin modificar —el descuento de fidelidad se aplica al total,
+  // no al artículo— así que el precio del catálogo es exactamente el que vio el comprador.
+  const catalogoPorId = new Map(loadProducts().map((p) => [p.id, p]));
+  const desconocidos = [];
+  const normalizedItems = items.map((item) => {
+    const id = String(item?.id ?? '').trim() || '—';
+    const delCatalogo = catalogoPorId.get(id);
+    if (!delCatalogo) desconocidos.push(id);
+    return {
+      id,
+      title: delCatalogo ? delCatalogo.title : String(item?.title ?? '').trim() || 'Producto',
+      // Tope absoluto de cordura: la cantidad no tenía techo y se podía pedir un millón de
+      // unidades para dejar el stock en negativo. 10.000 no estorba a una compra al mayor real.
+      quantity: Math.min(10000, Math.max(1, Math.trunc(Number(item?.quantity) || 1))),
+      price: delCatalogo ? Number(delCatalogo.price) || 0 : 0,
+    };
+  });
+
+  if (catalogoPorId.size === 0) {
+    console.error(`Pedido rechazado: el catálogo está vacío, no se pueden validar precios.`);
+    return res.status(503).json({ error: 'El catálogo no está disponible en este momento. Intenta de nuevo en unos minutos.' });
+  }
+  if (desconocidos.length > 0) {
+    console.error(`Pedido rechazado: productos que no están en el catálogo: ${desconocidos.join(', ')}`);
+    return res.status(400).json({ error: 'Alguno de los productos ya no está disponible. Vuelve a armar tu carrito.' });
+  }
   const merchandiseSubtotal = normalizedItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
   const round2 = (n) => Math.round(n * 100) / 100;
 
-  // Nivel de fidelidad: si hay userId, el backend recalcula el total autoritativo contra Supabase
-  // (con la service_role key) en vez de confiar en el `total` que mandó el navegador. Si Supabase
-  // no está configurado o la consulta falla, se degrada a comportamiento de invitado (usa el total
-  // del cliente, sin descuento) en vez de romper el checkout.
-  let finalTotal = total;
+  // El total SIEMPRE se calcula acá, con los precios del catálogo. Antes arrancaba en el `total`
+  // que mandaba el navegador y solo se recalculaba si el comprador tenía sesión iniciada: un
+  // invitado podía declarar el total que quisiera. Ahora el número del cliente ya no entra en
+  // ningún cálculo — se sigue exigiendo en el cuerpo solo para no romper el contrato de la API.
+  //
+  // El descuento de fidelidad se resuelve contra Supabase con la service_role key, nunca con un
+  // porcentaje mandado por el navegador. Si Supabase no está configurado o la consulta falla, el
+  // pedido sale sin descuento en vez de romper el checkout.
+  let finalTotal = round2(merchandiseSubtotal + deliveryFee);
   let discountApplied = null;
   let loyaltyResolved = false;
   if (userId && isLoyaltyConfigured()) {
