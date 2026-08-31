@@ -20,6 +20,8 @@ const {
   listPurchases,
   getPurchase,
   setPurchaseStatus,
+  countPurchases,
+  deletePurchasesByOrderIds,
 } = require('./supabase-admin');
 const { isCartReminderConfigured, sendAbandonedCartReminders } = require('./email-reminders');
 
@@ -2084,6 +2086,143 @@ app.get('/api/admin/categories', requireAdminRole('admin'), (req, res) => {
     ocultos: productos.filter((p) => pausadas[claveCategoria(p.category || 'General')]).length,
     totalProductos: productos.length,
   });
+});
+
+// --- Borrar los datos de prueba: dejar la tienda en cero antes de vender de verdad ---
+//
+// Durante el desarrollo se hicieron pedidos de prueba con el checkout REAL. Cada uno dejó rastro en
+// CINCO sitios, no en uno:
+//
+//   1. orders_location.json        el pedido
+//   2. stock_adjustments.json      el stock descontado, esperando a que PLADE procese la venta
+//   3. orders_pdfs/ + comprobantes + recibos
+//   4. customers.json              el cliente y su contador de pedidos
+//   5. purchases (Supabase)        el monto que decide el NIVEL DE FIDELIDAD del cliente
+//
+// Borrar solo el pedido dejaría lo demás huérfano. El caso peor es el 2: esos descuentos solo se
+// reconcilian cuando el stock de PLADE baja de verdad (ver replaceProductsCatalog), y como estas
+// ventas nunca ocurrieron, el stock quedaría rebajado PARA SIEMPRE sin que nada lo explique.
+//
+// ⚠️ Lo que esto NO puede deshacer: **las facturas que ya se crearon en PLADE**. Cada checkout de
+// Venezuela manda un pedido real a su sistema (submitOrderToPlade). Eso vive en la contabilidad del
+// negocio, fuera de acá, y hay que anularlo en PLADE a mano.
+
+/** Todo lo que se va a tocar, contado ANTES de tocarlo. No modifica nada. */
+async function resumenDatosDePrueba() {
+  const orders = loadOrdersLocation();
+  const adjustments = loadStockAdjustments();
+  const customers = loadCustomers();
+
+  const contarArchivos = (dir) => {
+    try {
+      return fs.readdirSync(dir).filter((f) => !f.startsWith('.')).length;
+    } catch {
+      return 0;
+    }
+  };
+
+  let compras = null;
+  try {
+    compras = isLoyaltyConfigured() ? await countPurchases() : null;
+  } catch (err) {
+    compras = { error: err.message };
+  }
+
+  const fechas = orders.map((o) => o.createdAt).filter(Boolean).sort();
+
+  return {
+    pedidos: orders.length,
+    pedidosAnulados: orders.filter((o) => o.cancelledAt).length,
+    desde: fechas[0] || null,
+    hasta: fechas[fechas.length - 1] || null,
+    productosConStockPendiente: Object.keys(adjustments).length,
+    unidadesPendientes: Object.values(adjustments).reduce((a, b) => a + Number(b || 0), 0),
+    clientes: Object.keys(customers).length,
+    pdfs: contarArchivos(ORDERS_PDF_DIR),
+    comprobantes: contarArchivos(ORDERS_PAYMENT_PROOFS_DIR),
+    recibos: contarArchivos(ORDERS_RECEIPTS_DIR),
+    comprasSupabase: compras,
+  };
+}
+
+app.get('/api/admin/test-data', requireAdminRole('admin'), async (req, res) => {
+  if (req.adminRole !== 'master') {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede ver o borrar los datos de prueba.' });
+  }
+  try {
+    res.json(await resumenDatosDePrueba());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/test-data/purge', requireAdminRole('admin'), async (req, res) => {
+  if (req.adminRole !== 'master') {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede borrar los datos de prueba.' });
+  }
+  // Palabra exacta, tecleada a mano en el panel. Un borrado total no puede depender de un solo clic
+  // ni de un JSON vacío mandado por error.
+  if (String(req.body && req.body.confirmar) !== 'BORRAR TODO') {
+    return res.status(400).json({ error: 'Falta la confirmación exacta.' });
+  }
+
+  try {
+    const antes = await resumenDatosDePrueba();
+    const orders = loadOrdersLocation();
+    const orderIds = orders.map((o) => o.orderId).filter(Boolean);
+
+    // RESPALDO PRIMERO, en el mismo disco persistente. Si algo de esto no eran pruebas, los datos
+    // siguen existiendo en este archivo y se pueden restaurar a mano.
+    const sello = new Date().toISOString().replace(/[:.]/g, '-');
+    const respaldo = path.join(DATA_DIR, `respaldo_antes_de_borrar_${sello}.json`);
+    fs.writeFileSync(
+      respaldo,
+      JSON.stringify({ generadoEl: new Date().toISOString(), por: req.adminUser.username, orders, customers: loadCustomers(), stockAdjustments: loadStockAdjustments() }, null, 2)
+    );
+
+    let comprasBorradas = null;
+    if (isLoyaltyConfigured() && orderIds.length > 0) {
+      try {
+        comprasBorradas = await deletePurchasesByOrderIds(orderIds);
+      } catch (err) {
+        // No se aborta: lo local ya se puede limpiar igual y el respaldo está hecho. Se informa.
+        comprasBorradas = { error: err.message };
+      }
+    }
+
+    saveOrdersLocation([]);
+    saveCustomers({});
+    // Clave: sin esto, el stock de los productos de prueba quedaría descontado para siempre.
+    saveStockAdjustments({});
+
+    const vaciarDir = (dir) => {
+      let n = 0;
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          if (f.startsWith('.')) continue;
+          fs.unlinkSync(path.join(dir, f));
+          n += 1;
+        }
+      } catch {
+        /* la carpeta puede no existir todavía */
+      }
+      return n;
+    };
+    const pdfs = vaciarDir(ORDERS_PDF_DIR);
+    const comprobantes = vaciarDir(ORDERS_PAYMENT_PROOFS_DIR);
+    const recibos = vaciarDir(ORDERS_RECEIPTS_DIR);
+
+    console.log(`DATOS DE PRUEBA BORRADOS por ${req.adminUser.username}: ${antes.pedidos} pedidos. Respaldo: ${respaldo}`);
+    res.json({
+      ok: true,
+      antes,
+      borrado: { pedidos: orders.length, pdfs, comprobantes, recibos, comprasSupabase: comprasBorradas },
+      respaldo: path.basename(respaldo),
+      despues: await resumenDatosDePrueba(),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.put('/api/admin/categories/:key/paused', requireAdminRole('admin'), (req, res) => {

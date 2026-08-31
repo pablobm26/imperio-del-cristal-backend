@@ -128,6 +128,44 @@ async function setPurchaseStatus(id, status) {
   if (error) throw new Error(`Supabase update purchase status: ${error.message}`);
 }
 
+/**
+ * Cuenta las compras registradas. Se usa en la vista previa del borrado de datos de prueba, para
+ * poder decir cuántas filas se van a tocar ANTES de tocarlas.
+ */
+async function countPurchases() {
+  if (!supabaseAdmin) return 0;
+  const { count, error } = await supabaseAdmin.from('purchases').select('id', { count: 'exact', head: true });
+  if (error) throw new Error(`Supabase count purchases: ${error.message}`);
+  return count || 0;
+}
+
+/**
+ * BORRA compras por su order_id. Irreversible.
+ *
+ * Existe solo para limpiar pedidos de prueba antes de abrir la tienda de verdad: esas filas son las
+ * que alimentan el nivel de fidelidad de cada cliente (ver supabase/003_loyalty_functions.sql), así
+ * que dejarlas haría que una cuenta de prueba apareciera como DIAMANTE con un descuento real.
+ *
+ * Borra por `order_id` y no la tabla entera a propósito: si algún día conviven pedidos reales con
+ * los de prueba, este camino sigue siendo seguro.
+ */
+async function deletePurchasesByOrderIds(orderIds) {
+  if (!supabaseAdmin) throw new Error('Supabase no está configurado.');
+  const ids = [...new Set((orderIds || []).map((x) => String(x)).filter(Boolean))];
+  if (ids.length === 0) return 0;
+
+  // En lotes: una URL con miles de ids en el filtro `in` se pasa del límite de largo de PostgREST.
+  let borradas = 0;
+  const TAMANO_LOTE = 100;
+  for (let i = 0; i < ids.length; i += TAMANO_LOTE) {
+    const lote = ids.slice(i, i + TAMANO_LOTE);
+    const { data, error } = await supabaseAdmin.from('purchases').delete().in('order_id', lote).select('id');
+    if (error) throw new Error(`Supabase delete purchases: ${error.message}`);
+    borradas += (data || []).length;
+  }
+  return borradas;
+}
+
 module.exports = {
   // Se exporta el cliente para que admin-users.js reuse esta misma instancia en vez de crear otra
   // con las mismas credenciales. Es null si faltan las env vars — quien lo use tiene que chequear
@@ -140,4 +178,6 @@ module.exports = {
   listPurchases,
   getPurchase,
   setPurchaseStatus,
+  countPurchases,
+  deletePurchasesByOrderIds,
 };
