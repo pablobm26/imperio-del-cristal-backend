@@ -179,11 +179,14 @@ async function sendEmail(to, items) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      from: CART_REMINDER_FROM_EMAIL,
+      // El nombre que se ve en la bandeja. Sin esto Gmail muestra solo la parte antes de la arroba
+      // —"pedidos"—, que no dice nada y no construye marca. Si CART_REMINDER_FROM_EMAIL ya trae un
+      // nombre entre comillas (formato `Nombre <correo@dominio>`), se respeta tal cual.
+      from: CART_REMINDER_FROM_EMAIL.includes('<')
+        ? CART_REMINDER_FROM_EMAIL
+        : `El Imperio del Cristal <${CART_REMINDER_FROM_EMAIL}>`,
       to,
-      // Sin "recordatorio" ni "no completaste": el asunto describe lo que el cliente gana (su
-      // selección sigue ahí), que es lo que decide si lo abre desde la bandeja.
-      subject: 'Tu selección sigue guardada — El Imperio del Cristal',
+      subject: 'Retoma tu compra en cristal44.com',
       html: renderReminderEmail(items),
       text: renderReminderText(items),
     }),
