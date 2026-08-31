@@ -90,6 +90,12 @@ const DETAILS_FILE = path.join(DATA_DIR, 'product_details.json');
 const REVIEWS_FILE = path.join(DATA_DIR, 'reviews.json');
 const ORDERS_FILE = path.join(DATA_DIR, 'orders_location.json');
 const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
+// Categorías pausadas: las que NO se le muestran al cliente aunque PLADE las siga mandando. Vive en
+// el disco persistente (/var/data) y no en Supabase a propósito — se consulta en CADA request del
+// catálogo público, y pegarle a la base por eso sería absurdo. Se guarda por NOMBRE de categoría,
+// no por id de producto: así una pausa sobrevive a las sincronizaciones con PLADE, que reemplazan
+// el catálogo entero cada 30 minutos.
+const PAUSED_CATEGORIES_FILE = path.join(DATA_DIR, 'paused_categories.json');
 const ORDERS_PDF_DIR = path.join(DATA_DIR, 'orders_pdfs');
 const ORDERS_PAYMENT_PROOFS_DIR = path.join(DATA_DIR, 'orders_payment_proofs');
 const ORDERS_RECEIPTS_DIR = path.join(DATA_DIR, 'orders_receipts');
@@ -117,6 +123,7 @@ if (!fs.existsSync(DETAILS_FILE)) fs.writeFileSync(DETAILS_FILE, '{}');
 if (!fs.existsSync(REVIEWS_FILE)) fs.writeFileSync(REVIEWS_FILE, '{}');
 if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
 if (!fs.existsSync(CUSTOMERS_FILE)) fs.writeFileSync(CUSTOMERS_FILE, '{}');
+if (!fs.existsSync(PAUSED_CATEGORIES_FILE)) fs.writeFileSync(PAUSED_CATEGORIES_FILE, '{}');
 if (!fs.existsSync(ORDERS_PDF_DIR)) fs.mkdirSync(ORDERS_PDF_DIR, { recursive: true });
 if (!fs.existsSync(ORDERS_PAYMENT_PROOFS_DIR)) fs.mkdirSync(ORDERS_PAYMENT_PROOFS_DIR, { recursive: true });
 if (!fs.existsSync(ORDERS_RECEIPTS_DIR)) fs.mkdirSync(ORDERS_RECEIPTS_DIR, { recursive: true });
@@ -331,6 +338,7 @@ function replaceProductsCatalog(newProducts) {
 
 const detailsStore = makeJsonStore(DETAILS_FILE);
 const reviewsStore = makeJsonStore(REVIEWS_FILE);
+const pausedCategoriesStore = makeJsonStore(PAUSED_CATEGORIES_FILE);
 
 function loadDetails() {
   return detailsStore.load();
@@ -712,6 +720,42 @@ function applyPendingStock(stock, productId, adjustments) {
   return Math.max(0, stock - pending);
 }
 
+/**
+ * Clave con la que se guarda una categoría pausada. PLADE manda los nombres tal como los tipeó
+ * alguien en su sistema: "Hilos", "HILOS ", "hilos" pueden convivir y cambiar de un día para otro.
+ * Normalizar al comparar evita que una categoría pausada "reviva" sola porque cambió una mayúscula
+ * o un espacio del otro lado.
+ */
+function claveCategoria(nombre) {
+  return String(nombre ?? '').trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
+/** `{ "HILOS": { pausedAt, by, nombreOriginal } }` — ver PAUSED_CATEGORIES_FILE. */
+function loadPausedCategories() {
+  return pausedCategoriesStore.load();
+}
+
+function savePausedCategories(data) {
+  pausedCategoriesStore.save(data);
+}
+
+function categoriasPausadasSet() {
+  return new Set(Object.keys(loadPausedCategories()));
+}
+
+/**
+ * Quita de una lista de productos los que pertenecen a una categoría pausada.
+ *
+ * Se aplica SOLO en los endpoints públicos, nunca en los del panel: si filtrara en
+ * getMergedProducts() el panel tampoco vería las categorías pausadas y no habría forma de
+ * reactivarlas — la pantalla quedaría vacía y el dueño encerrado afuera de su propia decisión.
+ */
+function soloCategoriasActivas(products) {
+  const pausadas = categoriasPausadasSet();
+  if (pausadas.size === 0) return products;
+  return products.filter((p) => !pausadas.has(claveCategoria(p.category || 'General')));
+}
+
 function getMergedProducts() {
   const products = loadProducts();
   const details = loadDetails();
@@ -931,6 +975,11 @@ function signAdminToken(role, actor = {}) {
       // Contrapartida: si se revoca el permiso, tarda hasta 12h (lo que dura el token) en aplicar,
       // o hasta que la persona vuelva a entrar. Aceptable para un permiso de solo lectura.
       cvc: actor.canViewCounter ? 1 : 0,
+      // `cpc` = can pause categories. Mismo criterio que `cvc`: viaja firmado para no consultar
+      // Supabase en cada request. Contrapartida idéntica — revocar el permiso tarda hasta 12h (lo
+      // que dura el token) o hasta el próximo login. Aceptable: pausar una categoría no destruye
+      // nada, se revierte con un clic y queda registrado quién lo hizo.
+      cpc: actor.canPauseCategories ? 1 : 0,
       exp: Date.now() + ADMIN_TOKEN_TTL_MS,
     })
   ).toString('base64url');
@@ -952,7 +1001,7 @@ function verifyAdminToken(token) {
   try {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     if (!data.exp || data.exp < Date.now()) return null;
-    return data; // { role, sub, username, cvc, exp }
+    return data; // { role, sub, username, cvc, cpc, exp }
   } catch {
     return null;
   }
@@ -978,6 +1027,7 @@ function requireAdminRole(...allowedRoles) {
       sub: data.sub || null,
       username: data.username || data.role,
       canViewCounter: Boolean(data.cvc),
+      canPauseCategories: Boolean(data.cpc),
     };
     next();
   };
@@ -1021,6 +1071,7 @@ async function authenticateAdmin(username, password) {
       username: user.username,
       fullName: user.full_name,
       canViewCounter: Boolean(user.can_view_counter),
+      canPauseCategories: Boolean(user.can_pause_categories),
     };
   }
 
@@ -1036,6 +1087,7 @@ async function authenticateAdmin(username, password) {
       username: ADMIN_USERNAME,
       fullName: 'Giormary Pacia (C.E.O.)',
       canViewCounter: true,
+      canPauseCategories: true,
     };
   }
   if (username === SALIDAS_USERNAME && password === SALIDAS_PASSWORD) {
@@ -1123,11 +1175,13 @@ app.post('/api/admin/login', async (req, res) => {
       sub: account.sub,
       username: account.username,
       canViewCounter: account.canViewCounter,
+      canPauseCategories: account.canPauseCategories,
     }),
     role: account.role,
     username: account.username,
     fullName: account.fullName,
     canViewCounter: Boolean(account.canViewCounter),
+    canPauseCategories: Boolean(account.canPauseCategories),
   });
 });
 
@@ -1145,14 +1199,14 @@ app.get('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
 });
 
 app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
-  const { username, fullName, password, role, canViewCounter } = req.body || {};
+  const { username, fullName, password, role, canViewCounter, canPauseCategories } = req.body || {};
 
   // Un admin no puede crear un master ni regalar el permiso del contador: si pudiera, el rol
   // superior no significaría nada — cualquier admin se fabricaría uno y se lo daría a sí mismo.
   // Va ANTES del chequeo de Supabase a propósito: una decisión de permisos no debe depender del
   // estado de la infraestructura, y con el orden inverso un 503 tapaba el 403.
-  if (req.adminRole !== 'master' && (role === 'master' || canViewCounter)) {
-    return res.status(403).json({ error: 'Solo una cuenta Master puede crear cuentas Master o autorizar el contador de ventas.' });
+  if (req.adminRole !== 'master' && (role === 'master' || canViewCounter || canPauseCategories)) {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede crear cuentas Master o autorizar permisos (contador de ventas, pausar categorías).' });
   }
   if (!adminUsers.isAdminUsersConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado: no hay tabla de usuarios todavía.' });
@@ -1160,7 +1214,7 @@ app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
 
   try {
     res.status(201).json({
-      user: await adminUsers.createUser({ username, fullName, password, role, canViewCounter }),
+      user: await adminUsers.createUser({ username, fullName, password, role, canViewCounter, canPauseCategories }),
     });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1168,7 +1222,7 @@ app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
 });
 
 app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) => {
-  const { role, active, password, canViewCounter } = req.body || {};
+  const { role, active, password, canViewCounter, canPauseCategories } = req.body || {};
   const esMaster = req.adminRole === 'master';
   const pierdeAdmin = role !== undefined && role !== 'admin' && role !== 'master';
 
@@ -1177,8 +1231,8 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
   if (req.adminUser.sub && req.adminUser.sub === req.params.id && (active === false || pierdeAdmin)) {
     return res.status(400).json({ error: 'No podés desactivar ni bajarte el rol a vos mismo.' });
   }
-  if (!esMaster && (role === 'master' || canViewCounter !== undefined)) {
-    return res.status(403).json({ error: 'Solo una cuenta Master puede asignar el rol Master o autorizar el contador de ventas.' });
+  if (!esMaster && (role === 'master' || canViewCounter !== undefined || canPauseCategories !== undefined)) {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede asignar el rol Master o autorizar permisos (contador de ventas, pausar categorías).' });
   }
   // Igual que en POST: los permisos se deciden antes que el estado de la infraestructura.
   if (!adminUsers.isAdminUsersConfigured()) {
@@ -1203,9 +1257,10 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
     }
 
     if (password !== undefined) await adminUsers.resetPassword(req.params.id, password);
-    const cambiaAlgo = role !== undefined || active !== undefined || canViewCounter !== undefined;
+    const cambiaAlgo =
+      role !== undefined || active !== undefined || canViewCounter !== undefined || canPauseCategories !== undefined;
     const user = cambiaAlgo
-      ? await adminUsers.updateUser(req.params.id, { role, active, canViewCounter })
+      ? await adminUsers.updateUser(req.params.id, { role, active, canViewCounter, canPauseCategories })
       : (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
 
     res.json({ user });
@@ -1916,6 +1971,108 @@ app.get('/api/admin/products', requireAdminRole('admin'), (req, res) => {
   }));
 
   res.json({ total, offset, pageSize: ADMIN_PRODUCTS_PAGE_SIZE, categories, products: page });
+});
+
+// --- Pausar categorías: qué parte del catálogo ve el cliente ---
+//
+// PLADE manda el catálogo completo y no tiene forma de decir "esto no lo vendo por ahora": borrar
+// el producto allá lo sacaría del inventario real. La pausa vive solo de este lado, no toca nada en
+// PLADE y se revierte con un clic.
+//
+// NO hay subcategorías. getInventario de PLADE devuelve exactamente 11 campos por producto y
+// `categoria` es el único de taxonomía (ver COMUNICACION-PLADE.md). Si algún día PLADE agrega una,
+// el lugar donde engancharla es claveCategoria() + este bloque.
+
+/**
+ * Quién puede pausar: el master siempre, y cualquier admin al que el master le haya dado el permiso
+ * desde la pantalla de Usuarios. Mismo patrón que el contador de ventas (`canViewCounter`).
+ */
+function puedePausarCategorias(req) {
+  return req.adminRole === 'master' || req.adminUser.canPauseCategories === true;
+}
+
+app.get('/api/admin/categories', requireAdminRole('admin'), (req, res) => {
+  const pausadas = loadPausedCategories();
+  const productos = loadProducts();
+
+  const porCategoria = new Map();
+  for (const p of productos) {
+    const nombre = String(p.category || 'General').trim() || 'General';
+    const clave = claveCategoria(nombre);
+    const info = porCategoria.get(clave) || { nombre, total: 0, conStock: 0 };
+    info.total += 1;
+    if (p.stock === null || p.stock > 0) info.conStock += 1;
+    porCategoria.set(clave, info);
+  }
+
+  // Una categoría pausada cuyos productos ya no vienen de PLADE tiene que seguir listándose: si
+  // desapareciera de la pantalla quedaría pausada para siempre, sin forma de reactivarla.
+  for (const [clave, info] of Object.entries(pausadas)) {
+    if (!porCategoria.has(clave)) {
+      porCategoria.set(clave, { nombre: info.nombreOriginal || clave, total: 0, conStock: 0 });
+    }
+  }
+
+  const categories = [...porCategoria.entries()]
+    .map(([key, info]) => ({
+      key,
+      name: info.nombre,
+      total: info.total,
+      inStock: info.conStock,
+      paused: Boolean(pausadas[key]),
+      pausedAt: pausadas[key] ? pausadas[key].pausedAt || null : null,
+      pausedBy: pausadas[key] ? pausadas[key].by || null : null,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name, 'es'));
+
+  res.json({
+    categories,
+    // El panel usa esto para mostrar los botones o solo la lista. El permiso real se revalida en el
+    // PUT de abajo: esconder un botón no es la protección.
+    canEdit: puedePausarCategorias(req),
+    ocultos: productos.filter((p) => pausadas[claveCategoria(p.category || 'General')]).length,
+    totalProductos: productos.length,
+  });
+});
+
+app.put('/api/admin/categories/:key/paused', requireAdminRole('admin'), (req, res) => {
+  if (!puedePausarCategorias(req)) {
+    return res.status(403).json({ error: 'Tu cuenta no tiene autorizado pausar categorías. Pedíselo al master.' });
+  }
+
+  const clave = claveCategoria(req.params.key);
+  if (!clave) return res.status(400).json({ error: 'Categoría no válida.' });
+
+  const paused = req.body && req.body.paused === true;
+  const pausadas = loadPausedCategories();
+
+  if (paused) {
+    const productos = loadProducts();
+    const existe = productos.find((p) => claveCategoria(p.category || 'General') === clave);
+    // Sin productos que la usen no hay nada que ocultar, y aceptar la pausa dejaría basura en el
+    // archivo que después aparece como una categoría fantasma en la pantalla.
+    if (!existe && !pausadas[clave]) {
+      return res.status(404).json({ error: 'Esa categoría no existe en el catálogo.' });
+    }
+    pausadas[clave] = {
+      pausedAt: new Date().toISOString(),
+      by: req.adminUser.username,
+      nombreOriginal: existe ? String(existe.category || 'General').trim() : clave,
+    };
+  } else {
+    delete pausadas[clave];
+  }
+
+  savePausedCategories(pausadas);
+  console.log(`Categoría ${clave} ${paused ? 'PAUSADA' : 'reactivada'} por ${req.adminUser.username}`);
+
+  const productos = loadProducts();
+  res.json({
+    ok: true,
+    key: clave,
+    paused,
+    ocultos: productos.filter((p) => pausadas[claveCategoria(p.category || 'General')]).length,
+  });
 });
 
 /**
@@ -2648,7 +2805,7 @@ app.post('/admin/products/:id', (req, res) => {
 });
 
 app.get('/api/products', (req, res) => {
-  res.json(getMergedProducts());
+  res.json(soloCategoriasActivas(getMergedProducts()));
 });
 
 // Lote de productos por ID (ej. "Últimos productos visitados" en tienda_web) — un solo request en
@@ -2658,7 +2815,7 @@ app.get('/api/products/batch', (req, res) => {
   const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, 20);
   if (ids.length === 0) return res.json([]);
   const idSet = new Set(ids);
-  res.json(getMergedProducts().filter((p) => idSet.has(p.id)));
+  res.json(soloCategoriasActivas(getMergedProducts()).filter((p) => idSet.has(p.id)));
 });
 
 // Muestra aleatoria de productos con imagen y stock — usado por tienda_web para sugerir productos
@@ -2670,7 +2827,7 @@ app.get('/api/products/random', (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 20);
   const exclude = new Set(String(req.query.exclude || '').split(',').map((s) => s.trim()).filter(Boolean));
   const maxStock = req.query.maxStock ? Math.max(1, parseInt(req.query.maxStock, 10) || 0) : null;
-  const pool = getMergedProducts().filter((p) => {
+  const pool = soloCategoriasActivas(getMergedProducts()).filter((p) => {
     if (exclude.has(p.id) || !p.image) return false;
     if (maxStock !== null) return p.stock !== null && p.stock > 0 && p.stock < maxStock;
     return p.stock === null || p.stock > 0;
@@ -2693,13 +2850,19 @@ app.get('/api/products/random', (req, res) => {
 app.get('/api/products/:id', (req, res) => {
   const raw = loadProducts().find((p) => p.id === req.params.id);
   if (!raw) return res.status(404).json({ error: 'Producto no encontrado.' });
+  // Mismo 404 que un producto inexistente, a propósito: si su categoría está pausada, la ficha no
+  // existe para el cliente. Sin esto, un enlace guardado o un resultado viejo de Google seguiría
+  // mostrándolo —y dejándolo comprar— aunque no aparezca en ninguna lista.
+  if (categoriasPausadasSet().has(claveCategoria(raw.category || 'General'))) {
+    return res.status(404).json({ error: 'Producto no encontrado.' });
+  }
   const merged = mergeProductWithDetails(raw, loadDetails());
   const stock = applyPendingStock(merged.stock, raw.id, loadStockAdjustments());
   res.json({ ...merged, stock, ...ratingSummary(loadReviews()[raw.id]) });
 });
 
 app.get('/api/categories', (req, res) => {
-  const products = loadProducts();
+  const products = soloCategoriasActivas(loadProducts());
   const categories = [...new Set(products.map((p) => p.category).filter(Boolean))];
   res.json(categories);
 });
@@ -3387,7 +3550,9 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    const products = getMergedProducts();
+    // soloCategoriasActivas: si no, el asistente recomendaría con entusiasmo productos que el
+    // cliente después no puede ni abrir.
+    const products = soloCategoriasActivas(getMergedProducts());
     const reply = await getChatReply(message, Array.isArray(history) ? history : [], products);
     res.json({ reply });
   } catch (err) {

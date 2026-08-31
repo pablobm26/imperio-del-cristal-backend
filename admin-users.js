@@ -55,6 +55,69 @@ function isMissingColumn(error) {
 /** Columnas que existen desde la migración 010; siempre seguras de pedir. */
 const COLUMNAS_BASE = 'id, username, full_name, password_hash, role, active';
 
+/**
+ * Columnas de PERMISO agregadas por migraciones posteriores, en el orden en que se agregaron.
+ * Cada una puede faltar si su migración no se corrió todavía.
+ *
+ * Antes esto se manejaba con un `if` a mano por columna. Con dos permisos ya hacían falta dos
+ * reintentos anidados, y el tercero se iba a olvidar — que es exactamente cómo se causó el apagón
+ * del 2026-08-09. Acá se resuelve de una vez: se pide todo, y ante un error de columna faltante se
+ * reintenta quitando la última, hasta llegar a las columnas base.
+ */
+const COLUMNAS_OPCIONALES = ['can_view_counter', 'can_pause_categories'];
+
+/** Lo que se devuelve al panel tras crear o editar un usuario. Nunca incluye el hash. */
+const SELECT_USUARIO =
+  'id, username, full_name, role, active, can_view_counter, can_pause_categories, created_at, last_login_at';
+
+/**
+ * Crear y editar SÍ escriben las columnas de permiso, así que no se pueden degradar como las
+ * lecturas: guardar a medias dejaría al dueño creyendo que dio un permiso que no se guardó. Se
+ * traduce el error críptico de Postgres a una instrucción concreta.
+ */
+function errorSiFaltaMigracion(error) {
+  if (!isMissingColumn(error)) return null;
+  return new Error(
+    'Falta correr una migración en Supabase (probablemente supabase/013_admin_pause_categories.sql). ' +
+      'Corréla en el SQL Editor y volvé a intentar.'
+  );
+}
+
+/**
+ * Ejecuta `consultar(columnas)` pidiendo primero todas las opcionales y degradando de a una si la
+ * base todavía no las tiene. Las que no se pudieron pedir se rellenan en `false`, para que el
+ * llamador reciba SIEMPRE la misma forma de objeto y no tenga que saber qué migraciones corrieron.
+ */
+async function consultarDegradando(consultar, base, contexto) {
+  let resultado = null;
+  for (let n = COLUMNAS_OPCIONALES.length; n >= 0; n--) {
+    const pedidas = COLUMNAS_OPCIONALES.slice(0, n);
+    resultado = await consultar([base, ...pedidas].join(', '));
+
+    // Falta alguna opcional: reintentar con una menos. Con n === 0 ya no hay nada que quitar y el
+    // error es real (falta una columna BASE), así que se devuelve tal cual.
+    if (resultado.error && isMissingColumn(resultado.error) && n > 0) continue;
+
+    const faltantes = COLUMNAS_OPCIONALES.slice(n);
+    if (!resultado.error && faltantes.length > 0) {
+      console.warn(
+        `${contexto}: faltan las columnas ${faltantes.join(', ')} en admin_users. ` +
+          'Corré las migraciones pendientes de supabase/. Mientras tanto esos permisos quedan en false.'
+      );
+      if (resultado.data) {
+        const rellenar = (fila) => {
+          const copia = { ...fila };
+          for (const c of faltantes) copia[c] = false;
+          return copia;
+        };
+        resultado.data = Array.isArray(resultado.data) ? resultado.data.map(rellenar) : rellenar(resultado.data);
+      }
+    }
+    return resultado;
+  }
+  return resultado;
+}
+
 /** Mensaje único para las pantallas de gestión cuando falta correr la migración. */
 const MISSING_TABLE_MESSAGE =
   'La tabla admin_users no existe todavía. Corré supabase/010_admin_users.sql en el SQL Editor de Supabase.';
@@ -81,17 +144,7 @@ async function findActiveUser(username) {
       .eq('active', true)
       .maybeSingle();
 
-  let { data, error } = await consultar(`${COLUMNAS_BASE}, can_view_counter`);
-
-  // Si falta `can_view_counter` (migración 011 sin correr) se reintenta con las columnas viejas,
-  // en vez de dejar afuera a cuentas que SÍ existen. El permiso queda en false hasta que se corra.
-  if (error && isMissingColumn(error)) {
-    console.warn(
-      'Login: falta la columna can_view_counter. Corré supabase/011_admin_master_role.sql. ' +
-        'Mientras tanto se ignora el permiso del contador.'
-    );
-    ({ data, error } = await consultar(COLUMNAS_BASE));
-  }
+  const { data, error } = await consultarDegradando(consultar, COLUMNAS_BASE, 'Login');
 
   if (error) {
     if (isMissingTable(error)) {
@@ -126,20 +179,15 @@ async function listUsers() {
       .order('username');
 
   const LISTA = 'id, username, full_name, role, active, created_at, last_login_at';
-  let { data, error } = await consultar(`${LISTA}, can_view_counter`);
-
-  // Igual que en findActiveUser: sin la migración 011 la pantalla de usuarios seguiría funcionando,
-  // solo que sin el permiso del contador, en vez de romperse entera.
-  if (error && isMissingColumn(error)) {
-    ({ data, error } = await consultar(LISTA));
-    if (!error && data) data = data.map((u) => ({ ...u, can_view_counter: false }));
-  }
+  // Igual que en findActiveUser: sin las migraciones de permisos la pantalla de usuarios sigue
+  // funcionando, solo que sin esos permisos, en vez de romperse entera.
+  const { data, error } = await consultarDegradando(consultar, LISTA, 'Usuarios');
 
   if (error) throw new Error(isMissingTable(error) ? MISSING_TABLE_MESSAGE : `No se pudo listar usuarios: ${error.message}`);
   return data || [];
 }
 
-async function createUser({ username, fullName, password, role, canViewCounter = false }) {
+async function createUser({ username, fullName, password, role, canViewCounter = false, canPauseCategories = false }) {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
 
   const user = normalizeUsername(username);
@@ -160,21 +208,24 @@ async function createUser({ username, fullName, password, role, canViewCounter =
       password_hash,
       role,
       can_view_counter: Boolean(canViewCounter),
+      can_pause_categories: Boolean(canPauseCategories),
     })
-    .select('id, username, full_name, role, active, can_view_counter, created_at, last_login_at')
+    .select(SELECT_USUARIO)
     .single();
 
   // 23505 = unique_violation. Se traduce a un mensaje entendible en vez del error crudo de Postgres.
   if (error) {
     if (error.code === '23505') throw new Error(`Ya existe un usuario "${user}".`);
     if (isMissingTable(error)) throw new Error(MISSING_TABLE_MESSAGE);
+    const faltaMigracion = errorSiFaltaMigracion(error);
+    if (faltaMigracion) throw faltaMigracion;
     throw new Error(`No se pudo crear el usuario: ${error.message}`);
   }
   return data;
 }
 
 /** Cambia rol y/o estado activo. No toca la contraseña — para eso está resetPassword(). */
-async function updateUser(id, { role, active, canViewCounter }) {
+async function updateUser(id, { role, active, canViewCounter, canPauseCategories }) {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
 
   const patch = {};
@@ -184,15 +235,20 @@ async function updateUser(id, { role, active, canViewCounter }) {
   }
   if (active !== undefined) patch.active = Boolean(active);
   if (canViewCounter !== undefined) patch.can_view_counter = Boolean(canViewCounter);
+  if (canPauseCategories !== undefined) patch.can_pause_categories = Boolean(canPauseCategories);
   if (Object.keys(patch).length === 0) throw new Error('No hay nada que cambiar.');
 
   const { data, error } = await supabaseAdmin
     .from('admin_users')
     .update(patch)
     .eq('id', id)
-    .select('id, username, full_name, role, active, can_view_counter, created_at, last_login_at')
+    .select(SELECT_USUARIO)
     .maybeSingle();
-  if (error) throw new Error(`No se pudo actualizar el usuario: ${error.message}`);
+  if (error) {
+    const faltaMigracion = errorSiFaltaMigracion(error);
+    if (faltaMigracion) throw faltaMigracion;
+    throw new Error(`No se pudo actualizar el usuario: ${error.message}`);
+  }
   if (!data) throw new Error('Usuario no encontrado.');
   return data;
 }
