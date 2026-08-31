@@ -730,6 +730,17 @@ function claveCategoria(nombre) {
   return String(nombre ?? '').trim().replace(/\s+/g, ' ').toUpperCase();
 }
 
+/**
+ * Orden alfabético A-Z para cualquier lista de categorías que vea una persona.
+ *
+ * `localeCompare` con 'es' y no una comparación de strings a secas: sin locale, la Ñ y las vocales
+ * acentuadas caen después de la Z (comparan por código de carácter), así que "PIÑA" quedaría al
+ * final de la lista en vez de entre PILA y PITA.
+ */
+function compararCategorias(a, b) {
+  return String(a).localeCompare(String(b), 'es', { sensitivity: 'base', numeric: true });
+}
+
 /** `{ "HILOS": { pausedAt, by, nombreOriginal } }` — ver PAUSED_CATEGORIES_FILE. */
 function loadPausedCategories() {
   return pausedCategoriesStore.load();
@@ -2023,7 +2034,7 @@ app.get('/api/admin/categories', requireAdminRole('admin'), (req, res) => {
       pausedAt: pausadas[key] ? pausadas[key].pausedAt || null : null,
       pausedBy: pausadas[key] ? pausadas[key].by || null : null,
     }))
-    .sort((a, b) => a.name.localeCompare(b.name, 'es'));
+    .sort((a, b) => compararCategorias(a.name, b.name));
 
   res.json({
     categories,
@@ -2863,7 +2874,12 @@ app.get('/api/products/:id', (req, res) => {
 
 app.get('/api/categories', (req, res) => {
   const products = soloCategoriasActivas(loadProducts());
-  const categories = [...new Set(products.map((p) => p.category).filter(Boolean))];
+  // Ordenadas alfabéticamente. Antes salían en el orden en que aparecían los productos en el
+  // catálogo, que es tanto como decir al azar: el cliente veía GENERAL, ACERO, ACRILICO, ALAMBRE…
+  // y más abajo CRISTAL CHECO CINDY antes que CRISTAL CHECO. Con 125 categorías en un desplegable,
+  // sin orden no se encuentra nada. El frontend NO reordena (ver CategoryDropdown), así que el
+  // orden tiene que salir bien de acá.
+  const categories = [...new Set(products.map((p) => p.category).filter(Boolean))].sort(compararCategorias);
   res.json(categories);
 });
 
