@@ -224,11 +224,35 @@ async function createUser({ username, fullName, password, role, canViewCounter =
   return data;
 }
 
-/** Cambia rol y/o estado activo. No toca la contraseña — para eso está resetPassword(). */
-async function updateUser(id, { role, active, canViewCounter, canPauseCategories }) {
+/**
+ * Cambia rol, estado activo, permisos y/o los datos de identidad (nombre y usuario).
+ * No toca la contraseña — para eso está resetPassword().
+ *
+ * `fullName` y `username` existen para poder CORREGIR: un nombre mal escrito al crear la cuenta se
+ * arregla acá en vez de tener que borrar la persona y volver a crearla, que le cambiaría el id y
+ * dejaría huérfano el historial de quién hizo qué.
+ */
+async function updateUser(id, { role, active, canViewCounter, canPauseCategories, fullName, username }) {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
 
   const patch = {};
+
+  if (fullName !== undefined) {
+    const nombre = String(fullName || '').trim();
+    if (!nombre) throw new Error('El nombre no puede quedar vacío.');
+    if (nombre.length > 80) throw new Error('El nombre no puede pasar de 80 caracteres.');
+    patch.full_name = nombre;
+  }
+
+  if (username !== undefined) {
+    const user = normalizeUsername(username);
+    if (user.length < 3 || user.length > 40) throw new Error('El usuario debe tener entre 3 y 40 caracteres.');
+    if (!/^[a-z0-9._-]+$/.test(user)) {
+      throw new Error('El usuario solo puede tener letras, números, punto, guion y guion bajo.');
+    }
+    patch.username = user;
+  }
+
   if (role !== undefined) {
     if (!isValidRole(role)) throw new Error(`Rol inválido. Válidos: ${ROLES.join(', ')}.`);
     patch.role = role;
@@ -245,6 +269,8 @@ async function updateUser(id, { role, active, canViewCounter, canPauseCategories
     .select(SELECT_USUARIO)
     .maybeSingle();
   if (error) {
+    // 23505 = unique_violation: ya hay otra cuenta con ese usuario.
+    if (error.code === '23505') throw new Error(`Ya existe un usuario "${patch.username}".`);
     const faltaMigracion = errorSiFaltaMigracion(error);
     if (faltaMigracion) throw faltaMigracion;
     throw new Error(`No se pudo actualizar el usuario: ${error.message}`);

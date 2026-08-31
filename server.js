@@ -1216,6 +1216,9 @@ app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
   // superior no significaría nada — cualquier admin se fabricaría uno y se lo daría a sí mismo.
   // Va ANTES del chequeo de Supabase a propósito: una decisión de permisos no debe depender del
   // estado de la infraestructura, y con el orden inverso un 503 tapaba el 403.
+  if (tapaCuentaDeEmergencia(username)) {
+    return res.status(400).json({ error: ERROR_TAPA_EMERGENCIA });
+  }
   if (req.adminRole !== 'master' && (role === 'master' || canViewCounter || canPauseCategories)) {
     return res.status(403).json({ error: 'Solo una cuenta Master puede crear cuentas Master o autorizar permisos (contador de ventas, pausar categorías).' });
   }
@@ -1232,8 +1235,26 @@ app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
   }
 });
 
+/**
+ * ¿Este nombre de usuario taparía una de las cuentas de respaldo por variables de entorno?
+ *
+ * El login busca PRIMERO en admin_users y solo cae al respaldo si no encuentra a nadie. Una fila con
+ * el mismo nombre que ADMIN_USERNAME intercepta el login y **deja al dueño fuera de su vía de
+ * emergencia** — ya pasó (ver la sección 6 del HANDOFF). Se compara en minúsculas porque
+ * normalizeUsername() guarda así, aunque el respaldo compare con mayúsculas y minúsculas exactas.
+ */
+function tapaCuentaDeEmergencia(username) {
+  const u = String(username || '').trim().toLowerCase();
+  if (!u) return false;
+  return u === String(ADMIN_USERNAME).trim().toLowerCase() || u === String(SALIDAS_USERNAME).trim().toLowerCase();
+}
+
+const ERROR_TAPA_EMERGENCIA =
+  'Ese nombre de usuario está reservado: es el de una cuenta de emergencia. Si lo usás acá, el login ' +
+  'de esa cuenta dejaría de funcionar y podrías quedarte afuera del panel. Elegí otro.';
+
 app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) => {
-  const { role, active, password, canViewCounter, canPauseCategories } = req.body || {};
+  const { role, active, password, canViewCounter, canPauseCategories, fullName, username } = req.body || {};
   const esMaster = req.adminRole === 'master';
   const pierdeAdmin = role !== undefined && role !== 'admin' && role !== 'master';
 
@@ -1244,6 +1265,13 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
   }
   if (!esMaster && (role === 'master' || canViewCounter !== undefined || canPauseCategories !== undefined)) {
     return res.status(403).json({ error: 'Solo una cuenta Master puede asignar el rol Master o autorizar permisos (contador de ventas, pausar categorías).' });
+  }
+  // Corregir el nombre o el usuario de otra persona es identidad, no operación: se reserva al master.
+  if (!esMaster && (fullName !== undefined || username !== undefined)) {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede corregir el nombre o el usuario de una cuenta.' });
+  }
+  if (username !== undefined && tapaCuentaDeEmergencia(username)) {
+    return res.status(400).json({ error: ERROR_TAPA_EMERGENCIA });
   }
   // Igual que en POST: los permisos se deciden antes que el estado de la infraestructura.
   if (!adminUsers.isAdminUsersConfigured()) {
@@ -1269,9 +1297,21 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
 
     if (password !== undefined) await adminUsers.resetPassword(req.params.id, password);
     const cambiaAlgo =
-      role !== undefined || active !== undefined || canViewCounter !== undefined || canPauseCategories !== undefined;
+      role !== undefined ||
+      active !== undefined ||
+      canViewCounter !== undefined ||
+      canPauseCategories !== undefined ||
+      fullName !== undefined ||
+      username !== undefined;
     const user = cambiaAlgo
-      ? await adminUsers.updateUser(req.params.id, { role, active, canViewCounter, canPauseCategories })
+      ? await adminUsers.updateUser(req.params.id, {
+          role,
+          active,
+          canViewCounter,
+          canPauseCategories,
+          fullName,
+          username,
+        })
       : (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
 
     res.json({ user });
