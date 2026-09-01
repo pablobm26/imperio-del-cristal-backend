@@ -2135,6 +2135,63 @@ function paisDeLaPeticion(req) {
 // personas. Sin este filtro, el conteo sube solo y el dueño cree que tiene tráfico que no tiene.
 const ES_BOT = /bot|crawl|spider|slurp|bing|yandex|baidu|duckduck|facebookexternalhit|whatsapp|telegram|preview|headless|lighthouse|pingdom|uptime|curl|wget|python-requests|axios|node-fetch/i;
 
+/**
+ * Tipo de aparato, deducido del user-agent. Se guarda solo la palabra ("movil"), nunca el
+ * user-agent completo: eso último, junto a la hora, identifica a una persona bastante bien.
+ *
+ * El orden importa: una tablet Android dice "Android" pero NO dice "Mobile", así que hay que
+ * descartarla antes de mirar si es móvil.
+ */
+function dispositivoDe(ua) {
+  if (/ipad|tablet|playbook|silk|kindle|(android(?!.*mobile))/i.test(ua)) return 'tablet';
+  if (/mobile|iphone|ipod|android|blackberry|iemobile|opera mini/i.test(ua)) return 'movil';
+  return 'escritorio';
+}
+
+/** Sistema operativo, también del user-agent. */
+function sistemaDe(ua) {
+  // iPhone/iPad primero: sus user-agents dicen "like Mac OS X" y si no, todos caerían en macOS.
+  if (/iphone|ipad|ipod/i.test(ua)) return 'iOS';
+  if (/android/i.test(ua)) return 'Android';
+  if (/windows nt/i.test(ua)) return 'Windows';
+  if (/mac os x|macintosh/i.test(ua)) return 'macOS';
+  if (/cros/i.test(ua)) return 'ChromeOS';
+  if (/linux|ubuntu|fedora/i.test(ua)) return 'Linux';
+  return 'Otro';
+}
+
+/**
+ * De dónde llegó la visita. El navegador manda solo el DOMINIO de la página anterior, nunca la URL
+ * completa: una URL de búsqueda o de un correo puede llevar datos personales en sus parámetros.
+ *
+ * Los dominios conocidos se agrupan con nombre legible (todos los `google.*` son Google) y el resto
+ * se guarda tal cual, con un tope de 25 por día para que nadie pueda inflar el archivo mandando
+ * dominios inventados.
+ */
+const ORIGENES_CONOCIDOS = [
+  [/^(www\.)?google\./i, 'Google'],
+  [/instagram|ig\.me/i, 'Instagram'],
+  [/facebook|fb\.com|fb\.me/i, 'Facebook'],
+  [/whatsapp|wa\.me/i, 'WhatsApp'],
+  [/tiktok/i, 'TikTok'],
+  [/youtube|youtu\.be/i, 'YouTube'],
+  [/bing\./i, 'Bing'],
+  [/t\.co$|twitter|x\.com$/i, 'X (Twitter)'],
+  [/telegram|t\.me/i, 'Telegram'],
+  [/duckduckgo/i, 'DuckDuckGo'],
+];
+const MAX_ORIGENES_POR_DIA = 25;
+
+function origenDe(crudo) {
+  const host = String(crudo || '').trim().toLowerCase().replace(/^www\./, '').slice(0, 80);
+  if (!host) return 'Directo';
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(host)) return 'Otros';
+  for (const [patron, nombre] of ORIGENES_CONOCIDOS) {
+    if (patron.test(host)) return nombre;
+  }
+  return host;
+}
+
 function claveDelDia(ms) {
   // En hora de Venezuela: si el día se cortara en UTC, las visitas de la tarde caerían en el día
   // siguiente y el gráfico no cuadraría con lo que ve el dueño. Mismo criterio que el contador de
@@ -2156,11 +2213,33 @@ app.post('/api/visit', (req, res) => {
     const hoy = claveDelDia(Date.now());
     const visitas = loadVisits();
     const dia = visitas[hoy] || { vistas: 0, sesiones: 0, paises: {} };
+    // Los días guardados antes de que existieran estos desgloses no traen las claves: se crean al
+    // vuelo en vez de romper.
+    dia.dispositivos = dia.dispositivos || {};
+    dia.sistemas = dia.sistemas || {};
+    dia.origenes = dia.origenes || {};
 
     dia.vistas += 1;
-    if (req.body && req.body.nueva === true) dia.sesiones += 1;
     const pais = paisDeLaPeticion(req);
     dia.paises[pais] = (dia.paises[pais] || 0) + 1;
+
+    const aparato = dispositivoDe(ua);
+    dia.dispositivos[aparato] = (dia.dispositivos[aparato] || 0) + 1;
+    const sistema = sistemaDe(ua);
+    dia.sistemas[sistema] = (dia.sistemas[sistema] || 0) + 1;
+
+    if (req.body && req.body.nueva === true) {
+      dia.sesiones += 1;
+      // El origen se cuenta UNA vez por visita, no por página: si contara cada página, una persona
+      // que llega de Instagram y mira 10 productos aparecería como 10 llegadas desde Instagram.
+      const origen = origenDe(req.body.origen);
+      if (dia.origenes[origen] !== undefined || Object.keys(dia.origenes).length < MAX_ORIGENES_POR_DIA) {
+        dia.origenes[origen] = (dia.origenes[origen] || 0) + 1;
+      } else {
+        dia.origenes['Otros'] = (dia.origenes['Otros'] || 0) + 1;
+      }
+    }
+
     visitas[hoy] = dia;
 
     // Se recorta a 90 días para que el archivo no crezca para siempre. Con ~1 KB por día son unos
@@ -2192,15 +2271,23 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
     serie.push({ dia: clave, vistas: d.vistas || 0, sesiones: d.sesiones || 0 });
   }
 
-  const porPais = new Map();
-  for (const { dia } of serie) {
-    const d = visitas[dia];
-    if (!d || !d.paises) continue;
-    for (const [pais, n] of Object.entries(d.paises)) porPais.set(pais, (porPais.get(pais) || 0) + n);
-  }
-  const paises = [...porPais.entries()]
-    .map(([codigo, vistas]) => ({ codigo, vistas }))
-    .sort((a, b) => b.vistas - a.vistas);
+  // Un solo recorrido para los cuatro desgloses.
+  const acumular = (campo) => {
+    const mapa = new Map();
+    for (const { dia } of serie) {
+      const d = visitas[dia];
+      if (!d || !d[campo]) continue;
+      for (const [clave, n] of Object.entries(d[campo])) mapa.set(clave, (mapa.get(clave) || 0) + n);
+    }
+    return [...mapa.entries()]
+      .map(([clave, total]) => ({ clave, total }))
+      .sort((a, b) => b.total - a.total);
+  };
+
+  const paises = acumular('paises').map(({ clave, total }) => ({ codigo: clave, vistas: total }));
+  const dispositivos = acumular('dispositivos');
+  const sistemas = acumular('sistemas');
+  const origenes = acumular('origenes');
 
   const totalVistas = serie.reduce((a, d) => a + d.vistas, 0);
   const totalSesiones = serie.reduce((a, d) => a + d.sesiones, 0);
@@ -2210,6 +2297,9 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
     dias,
     serie,
     paises,
+    dispositivos,
+    sistemas,
+    origenes,
     totalVistas,
     totalSesiones,
     hoy,
