@@ -2200,6 +2200,15 @@ function claveDelDia(ms) {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * Hora del día (0-23) en Venezuela. Se aplica el mismo desplazamiento que claveDelDia para que la
+ * hora y el día que se guardan sean del mismo reloj: si una fuera de Venezuela y la otra de UTC,
+ * las visitas de la noche aparecerían en la madrugada del día equivocado.
+ */
+function horaDeVenezuela(ms) {
+  return new Date(ms - 4 * 3600_000).getUTCHours();
+}
+
 app.post('/api/visit', (req, res) => {
   // Siempre 204, pase lo que pase: es una baliza de conteo, y un error acá no debe ensuciar la
   // consola del cliente ni hacerle pensar que la tienda falla.
@@ -2210,7 +2219,8 @@ app.post('/api/visit', (req, res) => {
     if (!ua || ES_BOT.test(ua)) return;
     if (isVisitRateLimited(req.ip)) return;
 
-    const hoy = claveDelDia(Date.now());
+    const ahora = Date.now();
+    const hoy = claveDelDia(ahora);
     const visitas = loadVisits();
     const dia = visitas[hoy] || { vistas: 0, sesiones: 0, paises: {} };
     // Los días guardados antes de que existieran estos desgloses no traen las claves: se crean al
@@ -2218,6 +2228,7 @@ app.post('/api/visit', (req, res) => {
     dia.dispositivos = dia.dispositivos || {};
     dia.sistemas = dia.sistemas || {};
     dia.origenes = dia.origenes || {};
+    dia.horas = dia.horas || {};
 
     dia.vistas += 1;
     const pais = paisDeLaPeticion(req);
@@ -2227,6 +2238,9 @@ app.post('/api/visit', (req, res) => {
     dia.dispositivos[aparato] = (dia.dispositivos[aparato] || 0) + 1;
     const sistema = sistemaDe(ua);
     dia.sistemas[sistema] = (dia.sistemas[sistema] || 0) + 1;
+
+    const hora = horaDeVenezuela(ahora);
+    dia.horas[hora] = (dia.horas[hora] || 0) + 1;
 
     if (req.body && req.body.nueva === true) {
       dia.sesiones += 1;
@@ -2285,6 +2299,16 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
   };
 
   const paises = acumular('paises').map(({ clave, total }) => ({ codigo: clave, vistas: total }));
+
+  // Las 24 horas SIEMPRE, incluso las que no tuvieron ninguna visita: un gráfico de horas al que le
+  // faltan las de la madrugada haría creer que el día empieza a las 7.
+  const porHora = new Map();
+  for (const { dia } of serie) {
+    const d = visitas[dia];
+    if (!d || !d.horas) continue;
+    for (const [h, n] of Object.entries(d.horas)) porHora.set(Number(h), (porHora.get(Number(h)) || 0) + n);
+  }
+  const horas = Array.from({ length: 24 }, (_, h) => ({ hora: h, vistas: porHora.get(h) || 0 }));
   const dispositivos = acumular('dispositivos');
   const sistemas = acumular('sistemas');
   const origenes = acumular('origenes');
@@ -2297,6 +2321,7 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
     dias,
     serie,
     paises,
+    horas,
     dispositivos,
     sistemas,
     origenes,
