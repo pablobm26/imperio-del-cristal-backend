@@ -98,6 +98,11 @@ const CUSTOMERS_FILE = path.join(DATA_DIR, 'customers.json');
 // no por id de producto: así una pausa sobrevive a las sincronizaciones con PLADE, que reemplazan
 // el catálogo entero cada 30 minutos.
 const PAUSED_CATEGORIES_FILE = path.join(DATA_DIR, 'paused_categories.json');
+// Visitas al sitio, AGREGADAS POR DÍA. No se guarda un registro por visita ni la IP de nadie: solo
+// cuántas hubo, de qué país y cuántas eran sesiones nuevas. Así el archivo no crece sin control y
+// no hay datos personales que proteger — el panel viejo ya filtró datos de clientes una vez
+// (sección 2.6 del HANDOFF) y no hace falta volver a crear ese riesgo para contar visitas.
+const VISITS_FILE = path.join(DATA_DIR, 'visits.json');
 const ORDERS_PDF_DIR = path.join(DATA_DIR, 'orders_pdfs');
 const ORDERS_PAYMENT_PROOFS_DIR = path.join(DATA_DIR, 'orders_payment_proofs');
 const ORDERS_RECEIPTS_DIR = path.join(DATA_DIR, 'orders_receipts');
@@ -126,6 +131,7 @@ if (!fs.existsSync(REVIEWS_FILE)) fs.writeFileSync(REVIEWS_FILE, '{}');
 if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
 if (!fs.existsSync(CUSTOMERS_FILE)) fs.writeFileSync(CUSTOMERS_FILE, '{}');
 if (!fs.existsSync(PAUSED_CATEGORIES_FILE)) fs.writeFileSync(PAUSED_CATEGORIES_FILE, '{}');
+if (!fs.existsSync(VISITS_FILE)) fs.writeFileSync(VISITS_FILE, '{}');
 if (!fs.existsSync(ORDERS_PDF_DIR)) fs.mkdirSync(ORDERS_PDF_DIR, { recursive: true });
 if (!fs.existsSync(ORDERS_PAYMENT_PROOFS_DIR)) fs.mkdirSync(ORDERS_PAYMENT_PROOFS_DIR, { recursive: true });
 if (!fs.existsSync(ORDERS_RECEIPTS_DIR)) fs.mkdirSync(ORDERS_RECEIPTS_DIR, { recursive: true });
@@ -341,6 +347,7 @@ function replaceProductsCatalog(newProducts) {
 const detailsStore = makeJsonStore(DETAILS_FILE);
 const reviewsStore = makeJsonStore(REVIEWS_FILE);
 const pausedCategoriesStore = makeJsonStore(PAUSED_CATEGORIES_FILE);
+const visitsStore = makeJsonStore(VISITS_FILE);
 
 function loadDetails() {
   return detailsStore.load();
@@ -746,6 +753,14 @@ function compararCategorias(a, b) {
 /** `{ "HILOS": { pausedAt, by, nombreOriginal } }` — ver PAUSED_CATEGORIES_FILE. */
 function loadPausedCategories() {
   return pausedCategoriesStore.load();
+}
+
+function loadVisits() {
+  return visitsStore.load();
+}
+
+function saveVisits(data) {
+  visitsStore.save(data);
 }
 
 function savePausedCategories(data) {
@@ -2088,6 +2103,122 @@ app.get('/api/admin/categories', requireAdminRole('admin'), (req, res) => {
   });
 });
 
+// --- Contador de visitas ---
+//
+// Se guarda AGREGADO POR DÍA, nunca visita por visita: `{ "2026-08-31": { vistas, sesiones,
+// paises: { VE: 120, CO: 8 } } }`. Sin IPs, sin identificadores, sin rutas por persona. Contar no
+// necesita saber quién.
+//
+// `vistas` = páginas abiertas. `sesiones` = visitas distintas (la primera página de cada sesión del
+// navegador). Se muestran las dos porque significan cosas distintas: 500 vistas de 20 sesiones es
+// mucha gente mirando poco, o poca gente mirando mucho.
+
+const DIAS_DE_VISITAS = 90;
+
+// El país lo pone la red que tenemos delante, no el navegador: Vercel en `x-vercel-ip-country` y
+// Cloudflare (que va delante de Render) en `cf-ipcountry`. Se prueban ambos porque la visita puede
+// llegar por cualquiera de los dos caminos. Si ninguno lo dice, se cuenta como desconocido en vez
+// de adivinar.
+function paisDeLaPeticion(req) {
+  const crudo =
+    req.headers['x-vercel-ip-country'] ||
+    req.headers['cf-ipcountry'] ||
+    req.headers['x-country'] ||
+    '';
+  const pais = String(crudo).trim().toUpperCase();
+  // Cloudflare usa XX para "no se sabe" y T1 para tráfico por Tor.
+  if (!/^[A-Z]{2}$/.test(pais) || pais === 'XX' || pais === 'T1') return '??';
+  return pais;
+}
+
+// Los buscadores y los previsualizadores de enlaces (WhatsApp, Facebook) NO son visitas de
+// personas. Sin este filtro, el conteo sube solo y el dueño cree que tiene tráfico que no tiene.
+const ES_BOT = /bot|crawl|spider|slurp|bing|yandex|baidu|duckduck|facebookexternalhit|whatsapp|telegram|preview|headless|lighthouse|pingdom|uptime|curl|wget|python-requests|axios|node-fetch/i;
+
+function claveDelDia(ms) {
+  // En hora de Venezuela: si el día se cortara en UTC, las visitas de la tarde caerían en el día
+  // siguiente y el gráfico no cuadraría con lo que ve el dueño. Mismo criterio que el contador de
+  // ventas (startOfTodayVenezuela).
+  const d = new Date(ms - 4 * 3600_000);
+  return d.toISOString().slice(0, 10);
+}
+
+app.post('/api/visit', (req, res) => {
+  // Siempre 204, pase lo que pase: es una baliza de conteo, y un error acá no debe ensuciar la
+  // consola del cliente ni hacerle pensar que la tienda falla.
+  res.status(204).end();
+
+  try {
+    const ua = String(req.headers['user-agent'] || '');
+    if (!ua || ES_BOT.test(ua)) return;
+    if (isVisitRateLimited(req.ip)) return;
+
+    const hoy = claveDelDia(Date.now());
+    const visitas = loadVisits();
+    const dia = visitas[hoy] || { vistas: 0, sesiones: 0, paises: {} };
+
+    dia.vistas += 1;
+    if (req.body && req.body.nueva === true) dia.sesiones += 1;
+    const pais = paisDeLaPeticion(req);
+    dia.paises[pais] = (dia.paises[pais] || 0) + 1;
+    visitas[hoy] = dia;
+
+    // Se recorta a 90 días para que el archivo no crezca para siempre. Con ~1 KB por día son unos
+    // 90 KB como mucho.
+    const dias = Object.keys(visitas).sort();
+    for (const d of dias.slice(0, Math.max(0, dias.length - DIAS_DE_VISITAS))) delete visitas[d];
+
+    saveVisits(visitas);
+  } catch (err) {
+    console.error('No se pudo registrar la visita:', err.message);
+  }
+});
+
+app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
+  if (req.adminRole !== 'master') {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede ver las visitas del sitio.' });
+  }
+
+  const dias = Math.min(Math.max(parseInt(req.query.dias, 10) || 30, 7), DIAS_DE_VISITAS);
+  const visitas = loadVisits();
+
+  // Se rellenan los días sin visitas con ceros: un gráfico que se salta los días vacíos miente
+  // sobre la forma de la curva.
+  const serie = [];
+  const hoyMs = Date.now();
+  for (let i = dias - 1; i >= 0; i--) {
+    const clave = claveDelDia(hoyMs - i * 24 * 3600_000);
+    const d = visitas[clave] || { vistas: 0, sesiones: 0, paises: {} };
+    serie.push({ dia: clave, vistas: d.vistas || 0, sesiones: d.sesiones || 0 });
+  }
+
+  const porPais = new Map();
+  for (const { dia } of serie) {
+    const d = visitas[dia];
+    if (!d || !d.paises) continue;
+    for (const [pais, n] of Object.entries(d.paises)) porPais.set(pais, (porPais.get(pais) || 0) + n);
+  }
+  const paises = [...porPais.entries()]
+    .map(([codigo, vistas]) => ({ codigo, vistas }))
+    .sort((a, b) => b.vistas - a.vistas);
+
+  const totalVistas = serie.reduce((a, d) => a + d.vistas, 0);
+  const totalSesiones = serie.reduce((a, d) => a + d.sesiones, 0);
+  const hoy = serie[serie.length - 1] || { vistas: 0, sesiones: 0 };
+
+  res.json({
+    dias,
+    serie,
+    paises,
+    totalVistas,
+    totalSesiones,
+    hoy,
+    // Para poder decirle al dueño "todavía no hay datos" en vez de mostrarle un gráfico vacío que
+    // parece un fallo.
+    desde: Object.keys(visitas).sort()[0] || null,
+  });
+});
+
 // --- Borrar los datos de prueba: dejar la tienda en cero antes de vender de verdad ---
 //
 // Durante el desarrollo se hicieron pedidos de prueba con el checkout REAL. Cada uno dejó rastro en
@@ -3078,6 +3209,9 @@ function makeRateLimiter(limit, windowMs) {
 }
 
 const isChatRateLimited = makeRateLimiter(20, 60 * 60 * 1000); // 20 messages/hour
+// Generoso a propósito: una persona navegando 40 páginas en una hora es normal, y pasarse solo
+// significa que se dejan de contar sus páginas de más, no que se le bloquee el sitio.
+const isVisitRateLimited = makeRateLimiter(120, 60 * 60 * 1000);
 const isReviewRateLimited = makeRateLimiter(5, 60 * 60 * 1000); // 5 reviews/hour
 const isOrderRateLimited = makeRateLimiter(10, 60 * 60 * 1000); // 10 pedidos/hora/IP
 
