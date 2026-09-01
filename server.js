@@ -2120,10 +2120,19 @@ const DIAS_DE_VISITAS = 90;
 // llegar por cualquiera de los dos caminos. Si ninguno lo dice, se cuenta como desconocido en vez
 // de adivinar.
 function paisDeLaPeticion(req) {
+  // ⚠️ EL ORDEN IMPORTA Y NO ES INTERCAMBIABLE. `x-country` va PRIMERO.
+  //
+  // La visita no llega acá desde el navegador: la reenvía la función de Vercel, que es quien sí
+  // conoce el país real del visitante y lo pone en `x-country`. Render está detrás de Cloudflare,
+  // y Cloudflare sella `cf-ipcountry` con el país de QUIEN LLAMA — o sea, el centro de datos de
+  // Vercel. Si `cf-ipcountry` se mira antes, tapa al país real y **todas las visitas quedan como
+  // Estados Unidos**, que es exactamente lo que pasó el 2026-08-31.
+  //
+  // Los otros dos quedan de respaldo por si algún día la baliza pegara directo al backend.
   const crudo =
+    req.headers['x-country'] ||
     req.headers['x-vercel-ip-country'] ||
     req.headers['cf-ipcountry'] ||
-    req.headers['x-country'] ||
     '';
   const pais = String(crudo).trim().toUpperCase();
   // Cloudflare usa XX para "no se sabe" y T1 para tráfico por Tor.
