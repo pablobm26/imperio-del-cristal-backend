@@ -31,6 +31,42 @@ const AVANCE = (n) => Buffer.from([ESC, 0x64, n]); // avanza n líneas
 const CORTAR = Buffer.from([GS, 0x56, 66, 0x00]);
 
 /**
+ * Código QR nativo de la impresora (comandos `GS ( k`).
+ *
+ * Se dibuja en la impresora, no se manda como imagen: sale nítido, instantáneo y ocupa unos pocos
+ * bytes en vez de varios kilobytes de mapa de bits.
+ *
+ * **No todas las térmicas lo soportan.** Las Xprinter y compatibles sí; las más viejas ignoran los
+ * comandos y no imprimen nada — sin error, simplemente no aparece. Por eso el número de pedido se
+ * sigue imprimiendo también en texto grande justo arriba: **si el QR no sale, el recibo no queda
+ * inservible**. Y se puede apagar desde el panel.
+ *
+ * @param {string} texto Lo que codifica. Acá va SOLO el código del pedido, igual que el código de
+ *   barras del PDF, para que lo lea la misma pantalla de escaneo de salidas.
+ * @param {number} tamano 1-16, el ancho de cada módulo. 6 da un QR de ~2,5 cm en papel de 80mm:
+ *   se lee de lejos con el teléfono y no se come el recibo.
+ */
+function qr(texto, tamano = 6) {
+  const datos = Buffer.from(String(texto), 'ascii');
+  // pL/pH: longitud de los datos MÁS 3, repartida en dos bytes (bajo, alto). Es la parte que más se
+  // equivoca de este protocolo — un byte mal y la impresora escupe basura.
+  const largo = datos.length + 3;
+  const pL = largo & 0xff;
+  const pH = (largo >> 8) & 0xff;
+  return Buffer.concat([
+    Buffer.from([GS, 0x28, 0x6b, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00]), // modelo 2
+    Buffer.from([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x43, Math.min(Math.max(tamano, 1), 16)]),
+    // Corrección de errores M (15%): un recibo térmico se roza en el bolsillo y se decolora. El
+    // nivel L ahorraría espacio pero deja de leerse con cualquier mancha.
+    Buffer.from([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x45, 0x31]),
+    Buffer.from([GS, 0x28, 0x6b, pL, pH, 0x31, 0x50, 0x30]),
+    datos,
+    Buffer.from([GS, 0x28, 0x6b, 0x03, 0x00, 0x31, 0x51, 0x30]), // imprimir
+  ]);
+}
+
+
+/**
  * Ancho del papel en caracteres. Es lo único que cambia entre los dos tamaños de rollo que se ven
  * en tiendas, y se equivoca fácil: con 48 en un rollo de 58mm cada línea se parte a la mitad.
  */
@@ -119,6 +155,9 @@ function componer(pedido, ancho) {
   // mano y varios recibos sobre el mostrador.
   texto(`PEDIDO ${pedido.orderId || ''}`, { alineacion: 'centro', negrita: true, doble: true });
   texto(fechaVenezuela(pedido.createdAt), { alineacion: 'centro' });
+  // El QR va acá, justo debajo del número y antes de los datos: es lo que se busca con el papel en
+  // la mano para escanearlo en la puerta, así que va arriba y no perdido al pie.
+  t.push({ tipo: 'qr', contenido: String(pedido.orderId || '') });
   separador('=');
 
   // --- Cliente ---
@@ -183,6 +222,7 @@ function aRenglones(instrucciones, ancho, acentos) {
     if (ins.tipo === 'separador') { salida.push({ texto: ins.caracter.repeat(ancho) }); continue; }
     if (ins.tipo === 'vacio') { for (let i = 0; i < ins.n; i++) salida.push({ texto: '' }); continue; }
     if (ins.tipo === 'corte') { salida.push({ corte: true }); continue; }
+    if (ins.tipo === 'qr') { salida.push({ qr: ins.contenido }); continue; }
 
     // A doble tamaño caben la mitad de caracteres: envolver con el ancho normal desbordaría.
     const anchoUtil = ins.doble ? Math.floor(ancho / 2) : ancho;
@@ -206,6 +246,12 @@ function construirRecibo(pedido, opciones = {}) {
   const partes = [INICIALIZAR];
 
   for (const r of renglones) {
+    if (r.qr) {
+      // Se puede apagar: si la impresora del local no soporta QR, el recibo sale igual con el
+      // número en texto y sin un hueco raro en medio.
+      if (opciones.qr !== false) partes.push(ALINEAR(1), qr(r.qr, opciones.qrTamano), Buffer.from([0x0a]));
+      continue;
+    }
     if (r.corte) {
       // Sin cuchilla el comando no molesta, pero se puede apagar para las que cortan a mano.
       if (opciones.cortar !== false) partes.push(AVANCE(3), CORTAR);
@@ -237,6 +283,13 @@ function previsualizarRecibo(pedido, opciones = {}) {
   return renglones
     .map((r) => {
       if (r.corte) return `${'>'.repeat(ancho)}\n[ aqui corta el papel ]`;
+      // En texto no se puede dibujar un QR: se marca el hueco, centrado igual que en el papel, para
+      // que la vista previa no dé a entender que va pegado a la izquierda.
+      if (r.qr) {
+        if (opciones.qr === false) return '';
+        const marca = `[ QR: ${r.qr} ]`;
+        return marca.padStart(Math.floor((ancho - marca.length) / 2) + marca.length);
+      }
       let linea = r.texto;
       if (r.alineacion === 'centro') linea = linea.padStart(Math.floor((ancho - linea.length) / 2) + linea.length);
       else if (r.alineacion === 'derecha') linea = linea.padStart(ancho);

@@ -8,6 +8,7 @@
 // compartidas.
 
 const bcrypt = require('bcryptjs');
+const { normalizarPermisos } = require('./permisos');
 const { supabaseAdmin, isLoyaltyConfigured } = require('./supabase-admin');
 
 const BCRYPT_ROUNDS = 10;
@@ -64,11 +65,11 @@ const COLUMNAS_BASE = 'id, username, full_name, password_hash, role, active';
  * del 2026-08-09. Acá se resuelve de una vez: se pide todo, y ante un error de columna faltante se
  * reintenta quitando la última, hasta llegar a las columnas base.
  */
-const COLUMNAS_OPCIONALES = ['can_view_counter', 'can_pause_categories'];
+const COLUMNAS_OPCIONALES = ['can_view_counter', 'can_pause_categories', 'permissions'];
 
 /** Lo que se devuelve al panel tras crear o editar un usuario. Nunca incluye el hash. */
 const SELECT_USUARIO =
-  'id, username, full_name, role, active, can_view_counter, can_pause_categories, created_at, last_login_at';
+  'id, username, full_name, role, active, can_view_counter, can_pause_categories, permissions, created_at, last_login_at';
 
 /**
  * Crear y editar SÍ escriben las columnas de permiso, así que no se pueden degradar como las
@@ -78,7 +79,7 @@ const SELECT_USUARIO =
 function errorSiFaltaMigracion(error) {
   if (!isMissingColumn(error)) return null;
   return new Error(
-    'Falta correr una migración en Supabase (probablemente supabase/013_admin_pause_categories.sql). ' +
+    'Falta correr una migración en Supabase (probablemente supabase/014_admin_permissions.sql). ' +
       'Corréla en el SQL Editor y volvé a intentar.'
   );
 }
@@ -156,6 +157,30 @@ async function findActiveUser(username) {
   return data || null;
 }
 
+/**
+ * Relee de la base los permisos de una cuenta, sin pasar por el token.
+ *
+ * El token lleva los permisos firmados para no consultar Supabase en cada request, pero eso implica
+ * que quitarle un permiso a alguien tarda hasta 12 horas (lo que dura el token) o hasta su próximo
+ * login. Para una acción **irreversible** eso no alcanza: si el dueño le quita el permiso de borrar
+ * la tienda a una persona, tiene que dejar de poder hacerlo YA, no mañana.
+ *
+ * Devuelve `null` si no hay tabla o la cuenta no existe — el llamador decide qué hacer con eso.
+ */
+async function permisosFrescos(id) {
+  if (!isAdminUsersConfigured() || !id) return null;
+  const consultar = (columnas) =>
+    supabaseAdmin.from('admin_users').select(columnas).eq('id', id).eq('active', true).maybeSingle();
+  const { data, error } = await consultarDegradando(consultar, 'id, role, active', 'Permisos frescos');
+  if (error || !data) return null;
+  return {
+    role: data.role,
+    permissions: data.permissions === undefined ? null : data.permissions,
+    canViewCounter: Boolean(data.can_view_counter),
+    canPauseCategories: Boolean(data.can_pause_categories),
+  };
+}
+
 /** Compara la contraseña contra el hash bcrypt. Nunca compara texto plano. */
 async function verifyPassword(plain, hash) {
   if (!plain || !hash) return false;
@@ -187,7 +212,7 @@ async function listUsers() {
   return data || [];
 }
 
-async function createUser({ username, fullName, password, role, canViewCounter = false, canPauseCategories = false }) {
+async function createUser({ username, fullName, password, role, canViewCounter = false, canPauseCategories = false, permissions }) {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
 
   const user = normalizeUsername(username);
@@ -209,6 +234,9 @@ async function createUser({ username, fullName, password, role, canViewCounter =
       role,
       can_view_counter: Boolean(canViewCounter),
       can_pause_categories: Boolean(canPauseCategories),
+      // null = "sin tocar": la cuenta usa los permisos por defecto de su rol. Es distinto de [],
+      // que significa "sin acceso a ninguna función" — ver permisos.js.
+      permissions: permissions === undefined ? null : normalizarPermisos(permissions),
     })
     .select(SELECT_USUARIO)
     .single();
@@ -232,7 +260,7 @@ async function createUser({ username, fullName, password, role, canViewCounter =
  * arregla acá en vez de tener que borrar la persona y volver a crearla, que le cambiaría el id y
  * dejaría huérfano el historial de quién hizo qué.
  */
-async function updateUser(id, { role, active, canViewCounter, canPauseCategories, fullName, username }) {
+async function updateUser(id, { role, active, canViewCounter, canPauseCategories, fullName, username, permissions }) {
   if (!isAdminUsersConfigured()) throw new Error('Supabase no está configurado.');
 
   const patch = {};
@@ -260,6 +288,9 @@ async function updateUser(id, { role, active, canViewCounter, canPauseCategories
   if (active !== undefined) patch.active = Boolean(active);
   if (canViewCounter !== undefined) patch.can_view_counter = Boolean(canViewCounter);
   if (canPauseCategories !== undefined) patch.can_pause_categories = Boolean(canPauseCategories);
+  // `null` explícito es un valor válido y con significado: devuelve la cuenta a los permisos de su
+  // rol. Por eso se compara contra undefined y no se usa un `if (permissions)` a secas.
+  if (permissions !== undefined) patch.permissions = permissions === null ? null : normalizarPermisos(permissions);
   if (Object.keys(patch).length === 0) throw new Error('No hay nada que cambiar.');
 
   const { data, error } = await supabaseAdmin
@@ -317,6 +348,7 @@ module.exports = {
   isAdminUsersConfigured,
   normalizeUsername,
   findActiveUser,
+  permisosFrescos,
   verifyPassword,
   touchLastLogin,
   listUsers,

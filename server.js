@@ -12,6 +12,7 @@ const { getChatReply } = require('./chat');
 const { construirRecibo, previsualizarRecibo } = require('./escpos-recibo');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade, normalizarSucursales } = require('./plade-marketplade-client');
 const adminUsers = require('./admin-users');
+const { FUNCIONES, permisosEfectivos, tienePermiso, normalizarPermisos } = require('./permisos');
 const productImages = require('./product-images');
 const {
   isLoyaltyConfigured,
@@ -1082,6 +1083,11 @@ function signAdminToken(role, actor = {}) {
       // que dura el token) o hasta el próximo login. Aceptable: pausar una categoría no destruye
       // nada, se revierte con un clic y queda registrado quién lo hizo.
       cpc: actor.canPauseCategories ? 1 : 0,
+      // `p` = permisos. Va firmado por el mismo motivo que cvc/cpc: no pegarle a Supabase en cada
+      // request. Misma contrapartida — quitar un permiso tarda hasta 12h (lo que dura el token) o
+      // hasta el próximo login de esa persona. Para lo destructivo eso no alcanza, así que
+      // `datos-prueba` se vuelve a validar contra la base en el momento de usarlo.
+      p: permisosEfectivos(actor),
       exp: Date.now() + ADMIN_TOKEN_TTL_MS,
     })
   ).toString('base64url');
@@ -1130,8 +1136,26 @@ function requireAdminRole(...allowedRoles) {
       username: data.username || data.role,
       canViewCounter: Boolean(data.cvc),
       canPauseCategories: Boolean(data.cpc),
+      // Tokens emitidos antes de que existieran los permisos no traen `p`. Se cae a lo que da el
+      // rol en vez de dejar a esa persona sin nada hasta que vuelva a entrar.
+      permissions: Array.isArray(data.p) ? data.p : null,
+      role: data.role,
     };
     next();
+  };
+}
+
+/**
+ * Exige un permiso concreto del catálogo (ver permisos.js), además del rol.
+ *
+ * Se usa DESPUÉS de requireAdminRole en la misma ruta: el rol dice quién puede entrar al panel y
+ * el permiso dice qué puede hacer ahí dentro. El master pasa siempre, sin depender de la lista.
+ */
+function requierePermiso(clave) {
+  return (req, res, next) => {
+    if (req.adminRole === 'master') return next();
+    if (tienePermiso({ role: req.adminRole, ...req.adminUser }, clave)) return next();
+    return res.status(403).json({ error: 'Tu cuenta no tiene habilitada esa función.' });
   };
 }
 
@@ -1174,6 +1198,8 @@ async function authenticateAdmin(username, password) {
       fullName: user.full_name,
       canViewCounter: Boolean(user.can_view_counter),
       canPauseCategories: Boolean(user.can_pause_categories),
+      // `undefined` si la migración 014 no se corrió: permisosEfectivos() cae a los del rol.
+      permissions: user.permissions === undefined ? null : user.permissions,
     };
   }
 
@@ -1278,12 +1304,34 @@ app.post('/api/admin/login', async (req, res) => {
       username: account.username,
       canViewCounter: account.canViewCounter,
       canPauseCategories: account.canPauseCategories,
+      permissions: account.permissions,
+      role: account.role,
     }),
     role: account.role,
     username: account.username,
     fullName: account.fullName,
     canViewCounter: Boolean(account.canViewCounter),
     canPauseCategories: Boolean(account.canPauseCategories),
+    // Ya resueltos: el panel no tiene que saber nada de roles ni de columnas viejas para decidir
+    // qué tarjetas pintar. Igual el backend revalida cada request — esto es solo presentación.
+    permisos: permisosEfectivos(account),
+  });
+});
+
+/**
+ * El catálogo de funciones que se pueden habilitar por cuenta.
+ *
+ * Lo sirve el backend y no lo repite el frontend a propósito: es la MISMA lista que usan los
+ * chequeos de permiso, así que una función nueva aparece sola en la pantalla de usuarios sin tener
+ * que acordarse de agregarla en dos sitios.
+ */
+app.get('/api/admin/permisos/catalogo', requireAdminRole('admin'), (req, res) => {
+  res.json({
+    funciones: FUNCIONES.map(({ clave, nombre, descripcion, rolesPorDefecto, peligrosa, aviso }) => ({
+      clave, nombre, descripcion, rolesPorDefecto, peligrosa: Boolean(peligrosa), aviso: aviso || null,
+    })),
+    // Los del que pregunta, ya resueltos: el panel decide con esto qué tarjetas pintar.
+    mios: permisosEfectivos({ role: req.adminRole, ...req.adminUser }),
   });
 });
 
@@ -1301,7 +1349,7 @@ app.get('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
 });
 
 app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
-  const { username, fullName, password, role, canViewCounter, canPauseCategories } = req.body || {};
+  const { username, fullName, password, role, canViewCounter, canPauseCategories, permissions } = req.body || {};
 
   // Un admin no puede crear un master ni regalar el permiso del contador: si pudiera, el rol
   // superior no significaría nada — cualquier admin se fabricaría uno y se lo daría a sí mismo.
@@ -1310,8 +1358,8 @@ app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
   if (tapaCuentaDeEmergencia(username)) {
     return res.status(400).json({ error: ERROR_TAPA_EMERGENCIA });
   }
-  if (req.adminRole !== 'master' && (role === 'master' || canViewCounter || canPauseCategories)) {
-    return res.status(403).json({ error: 'Solo una cuenta Master puede crear cuentas Master o autorizar permisos (contador de ventas, pausar categorías).' });
+  if (req.adminRole !== 'master' && (role === 'master' || canViewCounter || canPauseCategories || permissions !== undefined)) {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede crear cuentas Master o repartir permisos.' });
   }
   if (!adminUsers.isAdminUsersConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado: no hay tabla de usuarios todavía.' });
@@ -1319,7 +1367,7 @@ app.post('/api/admin/users', requireAdminRole('admin'), async (req, res) => {
 
   try {
     res.status(201).json({
-      user: await adminUsers.createUser({ username, fullName, password, role, canViewCounter, canPauseCategories }),
+      user: await adminUsers.createUser({ username, fullName, password, role, canViewCounter, canPauseCategories, permissions }),
     });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1345,7 +1393,7 @@ const ERROR_TAPA_EMERGENCIA =
   'de esa cuenta dejaría de funcionar y podrías quedarte afuera del panel. Elegí otro.';
 
 app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) => {
-  const { role, active, password, canViewCounter, canPauseCategories, fullName, username } = req.body || {};
+  const { role, active, password, canViewCounter, canPauseCategories, fullName, username, permissions } = req.body || {};
   const esMaster = req.adminRole === 'master';
   const pierdeAdmin = role !== undefined && role !== 'admin' && role !== 'master';
 
@@ -1354,8 +1402,13 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
   if (req.adminUser.sub && req.adminUser.sub === req.params.id && (active === false || pierdeAdmin)) {
     return res.status(400).json({ error: 'No podés desactivar ni bajarte el rol a vos mismo.' });
   }
-  if (!esMaster && (role === 'master' || canViewCounter !== undefined || canPauseCategories !== undefined)) {
-    return res.status(403).json({ error: 'Solo una cuenta Master puede asignar el rol Master o autorizar permisos (contador de ventas, pausar categorías).' });
+  if (!esMaster && (role === 'master' || canViewCounter !== undefined || canPauseCategories !== undefined || permissions !== undefined)) {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede asignar el rol Master o repartir permisos.' });
+  }
+  // Un master no puede dejarse a sí mismo sin funciones: sería la versión silenciosa de quedarse
+  // fuera del panel, y no habría forma de volver desde adentro.
+  if (permissions !== undefined && req.adminUser.sub && req.adminUser.sub === req.params.id) {
+    return res.status(400).json({ error: 'No podés cambiarte los permisos a vos mismo. Que lo haga otra cuenta Master.' });
   }
   // Corregir el nombre o el usuario de otra persona es identidad, no operación: se reserva al master.
   if (!esMaster && (fullName !== undefined || username !== undefined)) {
@@ -1392,6 +1445,7 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
       active !== undefined ||
       canViewCounter !== undefined ||
       canPauseCategories !== undefined ||
+      permissions !== undefined ||
       fullName !== undefined ||
       username !== undefined;
     const user = cambiaAlgo
@@ -1402,6 +1456,7 @@ app.patch('/api/admin/users/:id', requireAdminRole('admin'), async (req, res) =>
           canPauseCategories,
           fullName,
           username,
+          permissions,
         })
       : (await adminUsers.listUsers()).find((u) => u.id === req.params.id);
 
@@ -1588,8 +1643,10 @@ function startOfTodayVenezuela() {
   return inicioVE - VE_UTC_OFFSET_HOURS * 3600_000;
 }
 
+// Se mantiene el nombre por los sitios que ya lo llaman, pero ahora resuelve contra el catálogo:
+// así el permiso "contador" se puede dar tanto por la columna vieja como por la lista nueva.
 function puedeVerContador(req) {
-  return req.adminRole === 'master' || req.adminUser.canViewCounter === true;
+  return tienePermiso({ role: req.adminRole, ...req.adminUser }, 'contador');
 }
 
 function calcularContador() {
@@ -2130,7 +2187,7 @@ app.get('/api/admin/products', requireAdminRole('admin'), (req, res) => {
  * desde la pantalla de Usuarios. Mismo patrón que el contador de ventas (`canViewCounter`).
  */
 function puedePausarCategorias(req) {
-  return req.adminRole === 'master' || req.adminUser.canPauseCategories === true;
+  return tienePermiso({ role: req.adminRole, ...req.adminUser }, 'categorias');
 }
 
 app.get('/api/admin/categories', requireAdminRole('admin'), (req, res) => {
@@ -2552,10 +2609,7 @@ app.post('/api/admin/visits/reparar-paises', requireAdminRole('admin'), (req, re
   res.json({ ok: true, diasTocados, vistasReetiquetadas, hasta });
 });
 
-app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
-  if (req.adminRole !== 'master') {
-    return res.status(403).json({ error: 'Solo una cuenta Master puede ver las visitas del sitio.' });
-  }
+app.get('/api/admin/visits', requireAdminRole('admin'), requierePermiso('visitas'), (req, res) => {
 
   const dias = Math.min(Math.max(parseInt(req.query.dias, 10) || 30, 7), DIAS_DE_VISITAS);
   const visitas = loadVisits();
@@ -2681,10 +2735,7 @@ async function resumenDatosDePrueba() {
   };
 }
 
-app.get('/api/admin/test-data', requireAdminRole('admin'), async (req, res) => {
-  if (req.adminRole !== 'master') {
-    return res.status(403).json({ error: 'Solo una cuenta Master puede ver o borrar los datos de prueba.' });
-  }
+app.get('/api/admin/test-data', requireAdminRole('admin'), requierePermiso('datos-prueba'), async (req, res) => {
   try {
     res.json(await resumenDatosDePrueba());
   } catch (err) {
@@ -2692,9 +2743,16 @@ app.get('/api/admin/test-data', requireAdminRole('admin'), async (req, res) => {
   }
 });
 
-app.post('/api/admin/test-data/purge', requireAdminRole('admin'), async (req, res) => {
-  if (req.adminRole !== 'master') {
-    return res.status(403).json({ error: 'Solo una cuenta Master puede borrar los datos de prueba.' });
+app.post('/api/admin/test-data/purge', requireAdminRole('admin'), requierePermiso('datos-prueba'), async (req, res) => {
+  // Se RELEE el permiso de la base, no se cree al token. Los permisos viajan firmados para no
+  // consultar Supabase en cada request, pero eso hace que quitar uno tarde hasta 12 horas. Para un
+  // borrado irreversible eso no alcanza: si el dueño le quitó este permiso a alguien, tiene que
+  // dejar de poder borrar la tienda ya. El master no pasa por acá — su rol lo autoriza siempre.
+  if (req.adminRole !== 'master' && req.adminUser.sub) {
+    const fresco = await adminUsers.permisosFrescos(req.adminUser.sub);
+    if (!fresco || !tienePermiso(fresco, 'datos-prueba')) {
+      return res.status(403).json({ error: 'Tu cuenta ya no tiene habilitada esa función.' });
+    }
   }
   // Palabra exacta, tecleada a mano en el panel. Un borrado total no puede depender de un solo clic
   // ni de un JSON vacío mandado por error.
@@ -4511,7 +4569,7 @@ const SUCURSALES_CONOCIDAS = [
   { id: 1, nombre: 'DEPÓSITO GENERAL', direccion: 'Almacén principal', tipo: 'SUCURSAL' },
 ];
 
-app.get('/api/admin/inventario/sedes', requireAdminRole('master'), (req, res) => {
+app.get('/api/admin/inventario/sedes', requireAdminRole('admin'), requierePermiso('sedes'), (req, res) => {
   res.json({
     seleccionadas: sucursalesDeInventario(),
     ocultas: sucursalesOcultas(),
@@ -4528,7 +4586,7 @@ app.get('/api/admin/inventario/sedes', requireAdminRole('master'), (req, res) =>
  * Av Bolívar cuesta ~945 productos, y eso no se ve en una lista de casillas. Consulta PLADE en vivo,
  * así que tarda un segundo por sede.
  */
-app.post('/api/admin/inventario/sedes/previsualizar', requireAdminRole('master'), async (req, res) => {
+app.post('/api/admin/inventario/sedes/previsualizar', requireAdminRole('admin'), requierePermiso('sedes'), async (req, res) => {
   if (!isPladeConfigured()) return res.status(400).json({ error: 'PLADE no está configurado en el servidor.' });
   const ids = normalizarSucursales((req.body && req.body.sucursales) || []);
   try {
@@ -4548,7 +4606,7 @@ app.post('/api/admin/inventario/sedes/previsualizar', requireAdminRole('master')
   }
 });
 
-app.put('/api/admin/inventario/sedes', requireAdminRole('master'), async (req, res) => {
+app.put('/api/admin/inventario/sedes', requireAdminRole('admin'), requierePermiso('sedes'), async (req, res) => {
   const ids = normalizarSucursales((req.body && req.body.sucursales) || []);
 
   // Se guarda YA normalizado: si alguien mandara "1|5" —que PLADE acepta quedándose con una sola
@@ -4581,7 +4639,7 @@ app.put('/api/admin/inventario/sedes', requireAdminRole('master'), async (req, r
  * que no tiene por qué disparar una resincronización con PLADE (dos consultas de 2,4 MB) solo para
  * acortar una lista en pantalla.
  */
-app.put('/api/admin/inventario/sedes/ocultas', requireAdminRole('master'), (req, res) => {
+app.put('/api/admin/inventario/sedes/ocultas', requireAdminRole('admin'), requierePermiso('sedes'), (req, res) => {
   const enUso = sucursalesDeInventario();
   const pedidas = normalizarSucursales((req.body && req.body.ocultas) || []);
   const invalidas = pedidas.filter((id) => enUso.includes(id));
@@ -4643,6 +4701,11 @@ const PRINT_CONFIG_POR_DEFECTO = {
   acentos: false,      // ver sinAcentos() en escpos-recibo.js
   cortar: true,
   copias: 1,
+  // El QR del número de pedido. Encendido por defecto: la Xprinter XP-80C del local lo soporta y
+  // sirve para escanear la salida sin teclear. Se apaga si la impresora no lo dibuja — el número
+  // sale igual en texto grande justo arriba, así que apagarlo no deja el recibo inservible.
+  qr: true,
+  qrTamano: 6,
   modo: 'red',         // 'red' = TCP a IP:9100 | 'windows' = cola de impresión de la PC
   ip: '',
   puerto: 9100,
@@ -4906,11 +4969,11 @@ function estadoDeImpresion() {
   };
 }
 
-app.get('/api/admin/print', requireAdminRole('master'), (req, res) => {
+app.get('/api/admin/print', requireAdminRole('admin'), requierePermiso('impresion'), (req, res) => {
   res.json(estadoDeImpresion());
 });
 
-app.put('/api/admin/print/config', requireAdminRole('master'), (req, res) => {
+app.put('/api/admin/print/config', requireAdminRole('admin'), requierePermiso('impresion'), (req, res) => {
   const actual = loadPrintConfig();
   const body = req.body || {};
   const entero = (v, def, min, max) => {
@@ -4922,6 +4985,8 @@ app.put('/api/admin/print/config', requireAdminRole('master'), (req, res) => {
     anchoPapel: body.anchoPapel === undefined ? actual.anchoPapel : (Number(body.anchoPapel) === 58 ? 58 : 80),
     acentos: body.acentos === undefined ? actual.acentos : Boolean(body.acentos),
     cortar: body.cortar === undefined ? actual.cortar : Boolean(body.cortar),
+    qr: body.qr === undefined ? actual.qr : Boolean(body.qr),
+    qrTamano: body.qrTamano === undefined ? actual.qrTamano : entero(body.qrTamano, actual.qrTamano, 3, 10),
     copias: body.copias === undefined ? actual.copias : entero(body.copias, actual.copias, 1, 3),
     modo: body.modo === 'windows' ? 'windows' : (body.modo === 'red' ? 'red' : actual.modo),
     // Se valida la forma de la IP acá y no solo en la pantalla: una IP mal escrita deja al agente
@@ -4946,7 +5011,7 @@ app.put('/api/admin/print/config', requireAdminRole('master'), (req, res) => {
   res.json(estadoDeImpresion());
 });
 
-app.post('/api/admin/print/prueba', requireAdminRole('master'), (req, res) => {
+app.post('/api/admin/print/prueba', requireAdminRole('admin'), requierePermiso('impresion'), (req, res) => {
   const config = loadPrintConfig();
   if (!config.activo) return res.status(400).json({ error: 'La impresión está apagada. Actívala primero.' });
   const trabajo = encolarImpresion('PRUEBA', 'prueba');
@@ -4954,7 +5019,7 @@ app.post('/api/admin/print/prueba', requireAdminRole('master'), (req, res) => {
   res.json({ ok: true, id: trabajo.id, agenteConectado: agentesConectados.size > 0 });
 });
 
-app.post('/api/admin/print/reimprimir/:orderId', requireAdminRole('master'), (req, res) => {
+app.post('/api/admin/print/reimprimir/:orderId', requireAdminRole('admin'), requierePermiso('impresion'), (req, res) => {
   const pedido = loadOrdersLocation().find((o) => o.orderId === req.params.orderId);
   if (!pedido) return res.status(404).json({ error: 'Pedido no encontrado.' });
   const trabajo = encolarImpresion(pedido.orderId, 'reimpresion');
@@ -4964,7 +5029,7 @@ app.post('/api/admin/print/reimprimir/:orderId', requireAdminRole('master'), (re
 
 // Un trabajo atascado en `imprimiendo` vuelve a `pendiente` — pero lo decide una persona, después
 // de mirar si el recibo salió o no. Automatizarlo es exactamente cómo se imprime dos veces.
-app.post('/api/admin/print/reintentar/:id', requireAdminRole('master'), (req, res) => {
+app.post('/api/admin/print/reintentar/:id', requireAdminRole('admin'), requierePermiso('impresion'), (req, res) => {
   const cola = loadPrintQueue();
   const trabajo = cola.find((t) => t.id === req.params.id);
   if (!trabajo) return res.status(404).json({ error: 'Trabajo no encontrado.' });
@@ -4978,9 +5043,87 @@ app.post('/api/admin/print/reintentar/:id', requireAdminRole('master'), (req, re
   res.json({ ok: true, agenteConectado: agentesConectados.size > 0 });
 });
 
+/**
+ * Cómo va la impresión de recibos HOY, para quien está en el mostrador.
+ *
+ * Va en la pantalla de escaneo y no en la de impresión a propósito: **quien despacha es el primero
+ * que se entera de que un recibo no salió**, porque tiene el pedido delante y no tiene papel. Que
+ * tenga que avisarle al dueño para que entre a otra pantalla a reimprimir es una vuelta larga por
+ * un problema de diez segundos.
+ *
+ * Por eso lo puede ver y usar cualquiera con la función `scan`, no hace falta el permiso de
+ * `impresion` — que es el de CONFIGURAR la impresora, otra cosa.
+ */
+app.get('/api/admin/scan/impresion', requireAdminRole('admin', 'salidas', 'empleado'), requierePermiso('scan'), (req, res) => {
+  const config = loadPrintConfig();
+  if (!config.activo) {
+    // Con la impresión apagada no hay nada que reportar, y mostrar ceros haría pensar que falló.
+    return res.json({ activa: false });
+  }
+
+  const desde = startOfTodayVenezuela();
+  const deHoy = loadPrintQueue().filter((t) => {
+    const t0 = new Date(t.creado).getTime();
+    return Number.isFinite(t0) && t0 >= desde;
+  });
+
+  // Las pruebas no son ventas: contarlas inflaría el número que mira quien despacha.
+  const ventas = deHoy.filter((t) => t.motivo !== 'prueba');
+
+  const problemas = ventas
+    .filter((t) => t.estado === 'error' || t.estado === 'imprimiendo')
+    .map((t) => ({
+      id: t.id,
+      orderId: t.orderId,
+      estado: t.estado,
+      error: t.error,
+      creado: t.creado,
+    }))
+    .reverse();
+
+  res.json({
+    activa: true,
+    impresos: ventas.filter((t) => t.estado === 'impreso').length,
+    enCola: ventas.filter((t) => t.estado === 'pendiente').length,
+    problemas,
+    agenteConectado: agentesConectados.size > 0,
+    ultimaSenalDelAgente: estadoAgente.ultimaConexion,
+    desde: new Date(desde).toISOString(),
+  });
+});
+
+/**
+ * Reintenta la impresión de un recibo desde el mostrador.
+ *
+ * Deliberadamente MÁS ESTRECHO que el reintento del panel de impresión: solo acepta trabajos que
+ * fallaron o quedaron a medias. Quien despacha no debería poder reimprimir un recibo que ya salió
+ * bien —eso es lo que genera pedidos despachados dos veces—, así que un trabajo en estado `impreso`
+ * se rechaza aunque el id sea válido.
+ */
+app.post('/api/admin/scan/reimprimir/:id', requireAdminRole('admin', 'salidas', 'empleado'), requierePermiso('scan'), (req, res) => {
+  const cola = loadPrintQueue();
+  const trabajo = cola.find((t) => t.id === req.params.id);
+  if (!trabajo) return res.status(404).json({ error: 'Ese trabajo de impresión ya no existe.' });
+  if (trabajo.estado === 'impreso') {
+    return res.status(409).json({ error: 'Ese recibo ya se imprimió. Si hace falta otra copia, pedila al panel de impresión.' });
+  }
+  if (trabajo.estado === 'pendiente') {
+    return res.status(409).json({ error: 'Ese recibo ya está en cola, esperando a la impresora.' });
+  }
+
+  trabajo.estado = 'pendiente';
+  trabajo.error = null;
+  trabajo.entregadoEn = null;
+  trabajo.terminadoEn = null;
+  savePrintQueue(cola);
+  avisarAgentes({ tipo: 'trabajo', id: trabajo.id });
+  console.log(`Reimpresión pedida desde el mostrador: ${trabajo.orderId} (${req.adminUser.username})`);
+  res.json({ ok: true, agenteConectado: agentesConectados.size > 0 });
+});
+
 // El recibo en texto, para verlo en pantalla sin gastar papel. Sale del mismo código que compone lo
 // que se imprime, así que no puede desfasarse (ver escpos-recibo.js).
-app.get('/api/admin/print/vista-previa', requireAdminRole('master'), (req, res) => {
+app.get('/api/admin/print/vista-previa', requireAdminRole('admin'), requierePermiso('impresion'), (req, res) => {
   const config = loadPrintConfig();
   const pedido = req.query.orderId
     ? loadOrdersLocation().find((o) => o.orderId === req.query.orderId)
