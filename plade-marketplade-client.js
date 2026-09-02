@@ -36,11 +36,107 @@ function isPladeConfigured() {
   return Boolean(process.env.PLADE_USER && process.env.PLADE_PASSWORD && process.env.PLADE_TOKEN);
 }
 
-/** Catálogo completo: stock, categoría, imagen y precio reales desde PLADE. */
-async function getInventario() {
+/**
+ * Sucursales de las que se toma el inventario.
+ *
+ * **`id_sucursal` NO está en el manual de PLADE** — se descubrió probando el 2026-09-02, después de
+ * que el manual mostrara que `getInventario` solo acepta cuatro campos. Comprobado contra la cuenta
+ * real: sin filtro la suma de existencias da 418.180 unidades; con `id_sucursal=5` da 118.943 y con
+ * `id_sucursal=7`, 61.275. Filtra de verdad.
+ *
+ * Los otros dos nombres candidatos **no sirven**: `id_almacen` e `id_est` se envían sin error y
+ * devuelven el total de todas las sedes. Que no den error es justamente lo que los hace peligrosos.
+ *
+ * ⚠️ **Un `id_sucursal` vacío devuelve el TOTAL de todas las sedes, sin avisar.** Por eso acá se
+ * valida a entero positivo y, si no queda ninguno válido, **no se manda el campo en absoluto** en
+ * vez de mandarlo vacío. La diferencia entre "no filtrar" y "filtrar mal" tiene que ser explícita.
+ */
+function normalizarSucursales(valor) {
+  const lista = Array.isArray(valor) ? valor : [valor];
+  const limpias = [];
+  for (const v of lista) {
+    const n = Number(String(v ?? '').trim());
+    // Entero positivo o nada. Un "1|5" o un "1,5" llegan acá como NaN y se descartan — PLADE los
+    // acepta en silencio quedándose con UNA sola sede, que es el peor resultado posible: parece
+    // que funcionó.
+    if (Number.isInteger(n) && n > 0 && !limpias.includes(n)) limpias.push(n);
+  }
+  return limpias;
+}
+
+/**
+ * Suma el inventario de varias sucursales, producto por producto.
+ *
+ * PLADE **no combina sedes en una sola consulta**: se probó con `1,5`, `1;5`, `id_sucursal[]` y la
+ * clave repetida. Las dos primeras dan error y las otras se quedan con una sola sede sin avisar.
+ * Así que se consulta una vez por sede y se suma acá.
+ *
+ * `existencia` en `null` significa "PLADE no lleva la cuenta de este producto". Se conserva el
+ * `null` **solo si TODAS las sedes lo tienen así**; si alguna da un número, las demás cuentan como
+ * cero. Si se tratara el null como cero desde el principio, un producto sin conteo pasaría a figurar
+ * como agotado, que es una afirmación distinta y falsa (ver 2.32 del HANDOFF).
+ */
+function combinarSucursales(respuestas) {
+  const base = new Map();
+  for (const items of respuestas) {
+    for (const item of items) {
+      const clave = String(item.codigo_interno ?? item.id_plade ?? '').trim();
+      if (!clave) continue;
+      const n = item.existencia === null || item.existencia === undefined || item.existencia === ''
+        ? null
+        : Number(item.existencia);
+      const previo = base.get(clave);
+      if (!previo) {
+        // El resto de campos (nombre, precio, categoría, foto) es igual en todas las sedes: solo
+        // cambia la existencia. Se toma la primera respuesta como base.
+        base.set(clave, { ...item, existencia: n, _algunNumero: Number.isFinite(n) });
+        continue;
+      }
+      if (Number.isFinite(n)) {
+        previo.existencia = (previo._algunNumero ? Number(previo.existencia) : 0) + n;
+        previo._algunNumero = true;
+      }
+    }
+  }
+  return [...base.values()].map(({ _algunNumero, ...item }) => ({
+    ...item,
+    existencia: _algunNumero ? item.existencia : null,
+  }));
+}
+
+/**
+ * Catálogo completo: stock, categoría, imagen y precio reales desde PLADE.
+ *
+ * @param {number[]} sucursales IDs de las sedes a sumar. Vacío = todas (comportamiento histórico).
+ *
+ * **Si falla una sola de las consultas, falla todo.** Es deliberado: devolver la suma de las sedes
+ * que sí respondieron sería un número creíble y equivocado, y el catálogo se actualizaría con menos
+ * stock del real —dejando de vender mercancía que hay— sin que nadie note nada. Al lanzar, el
+ * llamador conserva el catálogo anterior, que es viejo pero coherente.
+ */
+async function getInventario(sucursales = []) {
   const { user, password, token } = credentialsFromEnv();
-  const body = await pladeRequest({ user, password, token, request: 'getInventario' });
-  return body.items || [];
+  const ids = normalizarSucursales(sucursales);
+
+  if (ids.length === 0) {
+    const body = await pladeRequest({ user, password, token, request: 'getInventario' });
+    return body.items || [];
+  }
+
+  // En serie y no en paralelo: cada respuesta pesa 2,4 MB y son el sistema con el que el negocio
+  // factura a diario. Dos consultas seguidas de un segundo no le hacen nada; dos simultáneas cada
+  // ocho minutos son ruido innecesario sobre su servidor.
+  const respuestas = [];
+  for (const id of ids) {
+    const body = await pladeRequest({ user, password, token, request: 'getInventario', id_sucursal: id });
+    const items = body.items || [];
+    if (items.length === 0) {
+      throw new Error(`La sucursal ${id} devolvió un catálogo vacío — se aborta para no borrar el stock.`);
+    }
+    respuestas.push(items);
+  }
+
+  return respuestas.length === 1 ? respuestas[0] : combinarSucursales(respuestas);
 }
 
 /**
@@ -227,6 +323,7 @@ async function saveOrderToPlade(order) {
 }
 
 module.exports = {
+  normalizarSucursales,
   getInventario,
   mapPladeItemToProduct,
   isPladeConfigured,

@@ -10,7 +10,7 @@ const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { construirRecibo, previsualizarRecibo } = require('./escpos-recibo');
-const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade } = require('./plade-marketplade-client');
+const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade, normalizarSucursales } = require('./plade-marketplade-client');
 const adminUsers = require('./admin-users');
 const productImages = require('./product-images');
 const {
@@ -107,6 +107,9 @@ const VISITS_FILE = path.join(DATA_DIR, 'visits.json');
 // Cola de impresión de la tienda. Vive en el disco y no en memoria porque su razón de ser es
 // sobrevivir: si la PC del local está apagada cuando entra un pedido, el trabajo espera ahí hasta
 // que el agente vuelva. Un reinicio de Render tampoco debe perder un pedido sin imprimir.
+// De qué sedes de PLADE se toma el inventario. Vive en el disco y no en una variable de entorno
+// porque el dueño lo cambia desde el panel: abrir una sede nueva no debería exigir un despliegue.
+const INVENTORY_CONFIG_FILE = path.join(DATA_DIR, 'inventory_config.json');
 const PRINT_QUEUE_FILE = path.join(DATA_DIR, 'print_queue.json');
 // Qué impresora usar y cómo. Lo edita el dueño desde el panel.
 const PRINT_CONFIG_FILE = path.join(DATA_DIR, 'print_config.json');
@@ -139,6 +142,10 @@ if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
 if (!fs.existsSync(CUSTOMERS_FILE)) fs.writeFileSync(CUSTOMERS_FILE, '{}');
 if (!fs.existsSync(PAUSED_CATEGORIES_FILE)) fs.writeFileSync(PAUSED_CATEGORIES_FILE, '{}');
 if (!fs.existsSync(VISITS_FILE)) fs.writeFileSync(VISITS_FILE, '{}');
+// Arranca con Depósito General (1) + Av Bolívar (5): lo pidió el dueño el 2026-09-02 tras ver que
+// esa combinación deja 4.356 productos a la venta, contra 4.755 de todas las sedes y 3.810 de solo
+// Av Bolívar. A partir de acá manda el panel — esto solo siembra el archivo la primera vez.
+if (!fs.existsSync(INVENTORY_CONFIG_FILE)) fs.writeFileSync(INVENTORY_CONFIG_FILE, JSON.stringify({ sucursales: [1, 5] }, null, 2));
 if (!fs.existsSync(PRINT_QUEUE_FILE)) fs.writeFileSync(PRINT_QUEUE_FILE, '[]');
 if (!fs.existsSync(PRINT_CONFIG_FILE)) fs.writeFileSync(PRINT_CONFIG_FILE, '{}');
 if (!fs.existsSync(ORDERS_PDF_DIR)) fs.mkdirSync(ORDERS_PDF_DIR, { recursive: true });
@@ -357,6 +364,7 @@ const detailsStore = makeJsonStore(DETAILS_FILE);
 const reviewsStore = makeJsonStore(REVIEWS_FILE);
 const pausedCategoriesStore = makeJsonStore(PAUSED_CATEGORIES_FILE);
 const visitsStore = makeJsonStore(VISITS_FILE);
+const inventoryConfigStore = makeJsonStore(INVENTORY_CONFIG_FILE);
 const printQueueStore = makeJsonStore(PRINT_QUEUE_FILE);
 const printConfigStore = makeJsonStore(PRINT_CONFIG_FILE);
 
@@ -823,6 +831,22 @@ function getMergedProducts() {
   });
 }
 
+/**
+ * De qué sucursales de PLADE se suma el inventario.
+ *
+ * Lista vacía = todas las sedes, que es el comportamiento histórico y el que hay que conservar si
+ * la configuración se pierde o se corrompe: preferible mostrar de más y que el chequeo del carrito
+ * lo corrija, a mostrar de menos y dejar de vender mercancía que sí hay.
+ */
+function sucursalesDeInventario() {
+  try {
+    const c = inventoryConfigStore.load();
+    return normalizarSucursales(Array.isArray(c && c.sucursales) ? c.sucursales : []);
+  } catch {
+    return [];
+  }
+}
+
 // --- Sincronización con PLADE SOFTWARE (getInventario) ---
 // Solo se activa si PLADE_USER/PLADE_PASSWORD/PLADE_TOKEN están configurados como variables de
 // entorno; sin ellas, el catálogo sigue viniendo del CSV subido manualmente en /admin (sin cambios
@@ -841,7 +865,7 @@ const PLADE_SYNC_INTERVAL_MS = 8 * 60 * 1000;
 let lastPladeSync = null; // { at: string, count: number } | { at: string, error: string }
 
 async function syncProductsFromPlade() {
-  const items = await getInventario();
+  const items = await getInventario(sucursalesDeInventario());
   const products = items.map(mapPladeItemToProduct).filter((p) => p.id && p.title);
   replaceProductsCatalog(products);
   lastPladeSync = { at: new Date().toISOString(), count: products.length };
@@ -2159,7 +2183,7 @@ const FRESCURA_MS = 15 * 1000;
 async function pladeFresco() {
   if (inventarioFresco && Date.now() - inventarioFresco.at < FRESCURA_MS) return inventarioFresco.porId;
 
-  const items = await getInventario();
+  const items = await getInventario(sucursalesDeInventario());
   const productos = items.map(mapPladeItemToProduct).filter((p) => p.id && p.title);
   const porId = new Map(productos.map((p) => [p.id, p]));
   inventarioFresco = { at: Date.now(), porId };
@@ -4443,6 +4467,91 @@ app.get('/api/health', (req, res) => res.json({
   // Segundos en pie. Un número chico justo después de un push es la señal de que el deploy entró.
   segundosEnPie: Math.round(process.uptime()),
 }));
+
+// ===========================================================================================
+// SEDES DE LAS QUE SE TOMA EL INVENTARIO
+// ===========================================================================================
+//
+// PLADE guarda la existencia por sucursal, y `getInventario` acepta `id_sucursal` para filtrar
+// —campo NO documentado en su manual, descubierto probando el 2026-09-02—. Pero **solo admite una
+// sede por consulta**: `1,5`, `1;5` y `id_sucursal[]` dan error, y `1|5` o la clave repetida se
+// quedan con una sola sin avisar. Así que sumar varias es cosa nuestra: una consulta por sede.
+//
+// Que esto se configure desde el panel y no por variable de entorno es a propósito: el negocio
+// abre y cierra sedes, y eso no debería exigir un despliegue.
+
+/** Las sedes del negocio, para que el panel las muestre por nombre y no como números sueltos. */
+const SUCURSALES_CONOCIDAS = [
+  { id: 11, nombre: 'SEDE NUEVA 2026', direccion: 'Casa Prebo (con piscina)', tipo: 'ALMACÉN' },
+  { id: 10, nombre: 'CASA PABLO', direccion: 'Casa Naguanagua (próximamente)', tipo: 'ALMACÉN' },
+  { id: 9, nombre: 'ONLINE', direccion: 'Casa El Trigal', tipo: 'SUCURSAL' },
+  { id: 7, nombre: 'NAGUANAGUA', direccion: 'CC Granja (02)', tipo: 'SUCURSAL' },
+  { id: 5, nombre: 'AV BOLÍVAR', direccion: 'CC Salma, Av Bolívar Norte', tipo: 'SUCURSAL' },
+  { id: 4, nombre: 'NAGUANAGUA (cerrada)', direccion: 'CC Granja (01)', tipo: 'SUCURSAL' },
+  { id: 3, nombre: 'GUACARA (cerrada)', direccion: 'CC Guacara', tipo: 'SUCURSAL' },
+  { id: 2, nombre: 'SAN DIEGO (cerrada)', direccion: 'CC Fin de Siglo', tipo: 'SUCURSAL' },
+  { id: 1, nombre: 'DEPÓSITO GENERAL', direccion: 'Almacén principal', tipo: 'SUCURSAL' },
+];
+
+app.get('/api/admin/inventario/sedes', requireAdminRole('master'), (req, res) => {
+  res.json({
+    seleccionadas: sucursalesDeInventario(),
+    conocidas: SUCURSALES_CONOCIDAS,
+    pladeConectado: isPladeConfigured(),
+    ultimaSync: lastPladeSync,
+  });
+});
+
+/**
+ * Cuánto habría a la venta con una selección dada, SIN guardarla.
+ *
+ * Existe porque el número es lo único que hace tangible la decisión: pasar de todas las sedes a solo
+ * Av Bolívar cuesta ~945 productos, y eso no se ve en una lista de casillas. Consulta PLADE en vivo,
+ * así que tarda un segundo por sede.
+ */
+app.post('/api/admin/inventario/sedes/previsualizar', requireAdminRole('master'), async (req, res) => {
+  if (!isPladeConfigured()) return res.status(400).json({ error: 'PLADE no está configurado en el servidor.' });
+  const ids = normalizarSucursales((req.body && req.body.sucursales) || []);
+  try {
+    const items = await getInventario(ids);
+    const productos = items.map(mapPladeItemToProduct).filter((p) => p.id && p.title);
+    // La MISMA regla que decide la banda azul/roja en la tienda (ver disponibilidad.ts y 2.32).
+    let venta = 0, agotados = 0, proximamente = 0;
+    for (const p of productos) {
+      const u = unidadesComprables(p.stock);
+      if (u !== null && u <= 0) agotados += 1;
+      else if (u === null || !p.price || p.price <= 0) proximamente += 1;
+      else venta += 1;
+    }
+    res.json({ sucursales: ids, total: productos.length, venta, agotados, proximamente });
+  } catch (err) {
+    res.status(502).json({ error: `PLADE no respondió: ${err.message}` });
+  }
+});
+
+app.put('/api/admin/inventario/sedes', requireAdminRole('master'), async (req, res) => {
+  const ids = normalizarSucursales((req.body && req.body.sucursales) || []);
+
+  // Se guarda YA normalizado: si alguien mandara "1|5" —que PLADE acepta quedándose con una sola
+  // sede, sin error— queda descartado acá y no llega nunca al archivo.
+  inventoryConfigStore.save({ sucursales: ids, actualizado: new Date().toISOString() });
+  console.log(`Sedes de inventario: ${ids.length === 0 ? 'todas' : ids.join(' + ')}`);
+
+  // Se resincroniza en el acto: sin esto el catálogo seguiría mostrando el stock viejo hasta ocho
+  // minutos después, y el dueño creería que el cambio no funcionó.
+  let sincronizado = null;
+  let errorSync = null;
+  if (isPladeConfigured()) {
+    try {
+      sincronizado = await syncProductsFromPlade();
+    } catch (err) {
+      // La configuración YA quedó guardada; lo que falló es traerla ahora. La próxima
+      // sincronización automática lo intenta de nuevo. Se informa en vez de callarlo.
+      errorSync = err.message;
+    }
+  }
+  res.json({ seleccionadas: ids, sincronizado, errorSync });
+});
 
 // ===========================================================================================
 // IMPRESIÓN EN LA TIENDA — cola + canal para el agente
