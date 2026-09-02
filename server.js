@@ -3438,6 +3438,54 @@ app.post('/api/orders', (req, res) => {
     console.error(`Pedido rechazado: productos que no están en el catálogo: ${desconocidos.join(', ')}`);
     return res.status(400).json({ error: 'Alguno de los productos ya no está disponible. Vuelve a armar tu carrito.' });
   }
+
+  // --- Stock: el pedido NO puede salir si no hay mercancía ---
+  //
+  // La tienda ya deshabilita el botón de un producto agotado, pero eso no alcanza y no es la
+  // protección: el carrito vive en el navegador y NO se revalida. Alguien agrega algo con stock,
+  // vuelve una semana después y paga — para entonces puede estar en cero. También se podía subir la
+  // cantidad con el botón "+" por encima de lo disponible.
+  //
+  // Importa más de lo que parece porque el checkout **crea una factura real en PLADE**
+  // (submitOrderToPlade): un pedido sin mercancía ensucia la contabilidad del negocio y hay que
+  // anularlo a mano allá.
+  //
+  // Se compara contra el stock EFECTIVO (catálogo menos lo ya comprometido por pedidos que PLADE
+  // todavía no procesó), que es exactamente el número que vio el comprador. Si se mirara el stock
+  // crudo, dos personas podrían llevarse la misma última unidad.
+  //
+  // `stock === null` significa "PLADE no lleva la cuenta de este producto", no "agotado": esos se
+  // dejan pasar como siempre.
+  const ajustesStock = loadStockAdjustments();
+  const agotados = [];
+  const insuficientes = [];
+  for (const item of normalizedItems) {
+    const delCatalogo = catalogoPorId.get(item.id);
+    if (!delCatalogo || delCatalogo.stock === null || delCatalogo.stock === undefined) continue;
+    const disponible = applyPendingStock(Number(delCatalogo.stock) || 0, item.id, ajustesStock);
+    if (disponible <= 0) {
+      agotados.push({ id: item.id, title: item.title });
+    } else if (item.quantity > disponible) {
+      insuficientes.push({ id: item.id, title: item.title, pedido: item.quantity, disponible });
+    }
+  }
+
+  if (agotados.length > 0 || insuficientes.length > 0) {
+    console.error(
+      `Pedido rechazado por stock. Agotados: ${agotados.map((x) => x.id).join(', ') || 'ninguno'}. ` +
+        `Insuficientes: ${insuficientes.map((x) => `${x.id} (pide ${x.pedido}, hay ${x.disponible})`).join(', ') || 'ninguno'}.`
+    );
+    // 409: el pedido está bien formado, pero el mundo cambió desde que se armó el carrito.
+    return res.status(409).json({
+      error:
+        agotados.length > 0
+          ? `Se agotó ${agotados.length === 1 ? 'un producto de tu carrito' : 'más de un producto de tu carrito'} mientras comprabas.`
+          : 'No queda suficiente cantidad de algún producto de tu carrito.',
+      // El detalle permite que la tienda diga QUÉ pasó con cada producto en vez de un error vago.
+      agotados,
+      insuficientes,
+    });
+  }
   const merchandiseSubtotal = normalizedItems.reduce((sum, item) => sum + item.price * item.quantity, 0);
   const round2 = (n) => Math.round(n * 100) / 100;
 
