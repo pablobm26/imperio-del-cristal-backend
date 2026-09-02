@@ -9,6 +9,7 @@ const cors = require('cors');
 const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
+const { construirRecibo, previsualizarRecibo } = require('./escpos-recibo');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade } = require('./plade-marketplade-client');
 const adminUsers = require('./admin-users');
 const productImages = require('./product-images');
@@ -103,6 +104,12 @@ const PAUSED_CATEGORIES_FILE = path.join(DATA_DIR, 'paused_categories.json');
 // no hay datos personales que proteger — el panel viejo ya filtró datos de clientes una vez
 // (sección 2.6 del HANDOFF) y no hace falta volver a crear ese riesgo para contar visitas.
 const VISITS_FILE = path.join(DATA_DIR, 'visits.json');
+// Cola de impresión de la tienda. Vive en el disco y no en memoria porque su razón de ser es
+// sobrevivir: si la PC del local está apagada cuando entra un pedido, el trabajo espera ahí hasta
+// que el agente vuelva. Un reinicio de Render tampoco debe perder un pedido sin imprimir.
+const PRINT_QUEUE_FILE = path.join(DATA_DIR, 'print_queue.json');
+// Qué impresora usar y cómo. Lo edita el dueño desde el panel.
+const PRINT_CONFIG_FILE = path.join(DATA_DIR, 'print_config.json');
 const ORDERS_PDF_DIR = path.join(DATA_DIR, 'orders_pdfs');
 const ORDERS_PAYMENT_PROOFS_DIR = path.join(DATA_DIR, 'orders_payment_proofs');
 const ORDERS_RECEIPTS_DIR = path.join(DATA_DIR, 'orders_receipts');
@@ -132,6 +139,8 @@ if (!fs.existsSync(ORDERS_FILE)) fs.writeFileSync(ORDERS_FILE, '[]');
 if (!fs.existsSync(CUSTOMERS_FILE)) fs.writeFileSync(CUSTOMERS_FILE, '{}');
 if (!fs.existsSync(PAUSED_CATEGORIES_FILE)) fs.writeFileSync(PAUSED_CATEGORIES_FILE, '{}');
 if (!fs.existsSync(VISITS_FILE)) fs.writeFileSync(VISITS_FILE, '{}');
+if (!fs.existsSync(PRINT_QUEUE_FILE)) fs.writeFileSync(PRINT_QUEUE_FILE, '[]');
+if (!fs.existsSync(PRINT_CONFIG_FILE)) fs.writeFileSync(PRINT_CONFIG_FILE, '{}');
 if (!fs.existsSync(ORDERS_PDF_DIR)) fs.mkdirSync(ORDERS_PDF_DIR, { recursive: true });
 if (!fs.existsSync(ORDERS_PAYMENT_PROOFS_DIR)) fs.mkdirSync(ORDERS_PAYMENT_PROOFS_DIR, { recursive: true });
 if (!fs.existsSync(ORDERS_RECEIPTS_DIR)) fs.mkdirSync(ORDERS_RECEIPTS_DIR, { recursive: true });
@@ -348,6 +357,8 @@ const detailsStore = makeJsonStore(DETAILS_FILE);
 const reviewsStore = makeJsonStore(REVIEWS_FILE);
 const pausedCategoriesStore = makeJsonStore(PAUSED_CATEGORIES_FILE);
 const visitsStore = makeJsonStore(VISITS_FILE);
+const printQueueStore = makeJsonStore(PRINT_QUEUE_FILE);
+const printConfigStore = makeJsonStore(PRINT_CONFIG_FILE);
 
 function loadDetails() {
   return detailsStore.load();
@@ -3949,6 +3960,11 @@ app.post('/api/orders', (req, res) => {
   // a que el navegador vuelva a preguntar. Va después de guardar para que la foto que se emite ya
   // incluya este pedido.
   broadcastContador();
+  // El recibo sale en la tienda en cuanto el cliente termina de pagar. Va DESPUÉS de guardar el
+  // pedido —nunca antes— para que no pueda existir un papel impreso de una venta que no quedó
+  // registrada. `encolarImpresion` no lanza: si la impresión falla, la venta sigue en pie y el
+  // recibo se puede sacar después desde el panel.
+  encolarImpresion(orderId, 'pedido');
   // Se descuenta para todo pedido que se completa (invitado o no, cualquier método de pago) —
   // mismo momento en el que ya se crea la factura real en PLADE más abajo. Si el dueño anula el
   // pedido después, se repone en POST /admin/purchases/:id (solo pedidos con userId llegan ahí).
@@ -4427,6 +4443,400 @@ app.get('/api/health', (req, res) => res.json({
   // Segundos en pie. Un número chico justo después de un push es la señal de que el deploy entró.
   segundosEnPie: Math.round(process.uptime()),
 }));
+
+// ===========================================================================================
+// IMPRESIÓN EN LA TIENDA — cola + canal para el agente
+// ===========================================================================================
+//
+// El problema de fondo: este servidor vive en Render, en internet, y la impresora vive en la tienda
+// con una IP privada (192.168.x.x) que no existe fuera de ese local. **Desde acá no hay forma de
+// alcanzarla.** La alternativa —abrir la impresora a internet con un redireccionamiento de puerto—
+// sería un agujero de seguridad de primer orden: el puerto 9100 no pide autenticación de ninguna
+// clase, así que cualquiera que lo encuentre puede lanzar trabajos o usar la impresora como puerta
+// de entrada a la red del negocio.
+//
+// Por eso hay un **agente**: un programa que corre en una PC de la tienda y llama HACIA AFUERA. Se
+// queda esperando en `/api/print/stream`, y cuando entra un pedido el servidor le avisa por ahí.
+// Sin puertos abiertos, sin IP fija y sin tocar el router.
+//
+// El recorrido completo de un pedido:
+//
+//   cliente paga  ->  encolarImpresion()  ->  aviso por SSE  ->  el agente pide los bytes
+//                                                                     |
+//              se marca 'impreso'  <-  el agente reporta  <-  los manda a la impresora
+//
+// **La numeración de estados importa para no imprimir dos veces**, que es el fallo caro acá: un
+// pedido reimpreso es un pedido que se despacha dos veces. Ver `PRINT_ESTADOS`.
+
+// Un trabajo pasa por: pendiente -> imprimiendo -> impreso (o error).
+//
+// `imprimiendo` existe justamente para lo que puede salir mal: el agente pide los bytes, la PC se
+// apaga a mitad, y nadie sabe si el papel salió o no. Ese trabajo NO se reintenta solo — se queda
+// visible en el panel para que una persona decida, porque solo una persona puede mirar si el recibo
+// está en la bandeja. Reintentar a ciegas es exactamente cómo se imprime dos veces.
+const PRINT_ESTADOS = ['pendiente', 'imprimiendo', 'impreso', 'error'];
+
+// Cuántos trabajos se conservan. Los viejos ya impresos no sirven para nada salvo ocupar disco; se
+// podan por el extremo antiguo cada vez que se encola uno nuevo.
+const PRINT_MAX_TRABAJOS = 500;
+
+// El agente se identifica con su propio secreto, separado del ADMIN_PASSWORD. Si mañana hay que
+// cambiar el del agente (se cambia la PC de la tienda, se va un empleado) no debe obligar a cambiar
+// la contraseña del panel, ni al revés. Sin token configurado el canal queda cerrado del todo:
+// preferible que la impresión no funcione a que cualquiera lea los pedidos del día.
+const PRINT_AGENT_TOKEN = process.env.PRINT_AGENT_TOKEN || '';
+
+const PRINT_CONFIG_POR_DEFECTO = {
+  activo: false,
+  anchoPapel: 80,      // 80mm = 48 caracteres; 58mm = 32
+  acentos: false,      // ver sinAcentos() en escpos-recibo.js
+  cortar: true,
+  copias: 1,
+  modo: 'red',         // 'red' = TCP a IP:9100 | 'windows' = cola de impresión de la PC
+  ip: '',
+  puerto: 9100,
+  nombreCola: '',
+};
+
+function loadPrintConfig() {
+  return { ...PRINT_CONFIG_POR_DEFECTO, ...(printConfigStore.load() || {}) };
+}
+function savePrintConfig(config) {
+  printConfigStore.save(config);
+}
+function loadPrintQueue() {
+  const q = printQueueStore.load();
+  return Array.isArray(q) ? q : [];
+}
+function savePrintQueue(q) {
+  printQueueStore.save(q);
+}
+
+// --- Aviso en vivo al agente -------------------------------------------------------------------
+// Mismo mecanismo que el contador de ventas del panel (ver /api/admin/counter/stream): una conexión
+// abierta que el servidor usa para empujar. Se prefiere a que el agente pregunte cada X segundos
+// porque el recibo tiene que salir MIENTRAS el cliente todavía está ahí, no un minuto después.
+const agentesConectados = new Set();
+
+function avisarAgentes(evento) {
+  for (const res of agentesConectados) {
+    try {
+      res.write(`data: ${JSON.stringify(evento)}\n\n`);
+    } catch {
+      /* la limpieza la hace el manejador de 'close' */
+    }
+  }
+}
+
+/**
+ * Mete un pedido en la cola de impresión.
+ *
+ * **Nunca lanza.** Se llama desde la creación del pedido, y un fallo acá no puede tumbar una venta
+ * que el cliente ya pagó: si la impresión falla, el pedido igual queda registrado y se puede
+ * reimprimir desde el panel. Es la regla de siempre — lo accesorio no rompe lo principal.
+ */
+function encolarImpresion(orderId, motivo = 'pedido') {
+  try {
+    const config = loadPrintConfig();
+    // Con la impresión apagada no se acumulan trabajos: al prenderla, el dueño se encontraría con
+    // una tanda de recibos viejos saliendo de golpe.
+    if (!config.activo) return null;
+
+    const cola = loadPrintQueue();
+    const trabajo = {
+      id: `p${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+      orderId,
+      motivo,                 // 'pedido' | 'reimpresion' | 'prueba'
+      estado: 'pendiente',
+      creado: new Date().toISOString(),
+      entregadoEn: null,
+      terminadoEn: null,
+      error: null,
+    };
+    cola.push(trabajo);
+    savePrintQueue(cola.slice(-PRINT_MAX_TRABAJOS));
+    avisarAgentes({ tipo: 'trabajo', id: trabajo.id });
+    return trabajo;
+  } catch (err) {
+    console.error('No se pudo encolar la impresión:', err.message);
+    return null;
+  }
+}
+
+// --- Autenticación del agente ------------------------------------------------------------------
+function requireAgenteImpresion(req, res, next) {
+  if (!PRINT_AGENT_TOKEN) {
+    return res.status(503).json({ error: 'La impresión no está configurada en el servidor.' });
+  }
+  const cabecera = String(req.headers.authorization || '');
+  const token = cabecera.startsWith('Bearer ') ? cabecera.slice(7) : '';
+  // Comparación de largo constante: con `!==` el tiempo de respuesta filtra cuántos caracteres del
+  // token son correctos, y con eso se adivina de a uno. Es barato hacerlo bien.
+  const a = Buffer.from(token);
+  const b = Buffer.from(PRINT_AGENT_TOKEN);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'No autorizado.' });
+  }
+  return next();
+}
+
+// Lo último que se supo del agente, para que el panel pueda decir "conectado" o "sin señal desde
+// las 3:40". Vive en memoria a propósito: si Render reinicia, el agente se reconecta solo en
+// segundos y el dato se rehace. Guardarlo en disco sería escribir en cada latido para nada.
+let estadoAgente = { ultimaConexion: null, impresorasVistas: [], version: null };
+
+// --- Endpoints del AGENTE ----------------------------------------------------------------------
+
+// Canal abierto. El agente se queda escuchando acá y el servidor le empuja los avisos.
+app.get('/api/print/stream', requireAgenteImpresion, (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    // Sin esto el proxy de Render bufferea el stream y no llega nada hasta que se cierra.
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  agentesConectados.add(res);
+  estadoAgente.ultimaConexion = new Date().toISOString();
+
+  // Por si quedó trabajo de cuando la PC estaba apagada: se avisa al conectar, sin esperar a que
+  // entre un pedido nuevo.
+  res.write(`data: ${JSON.stringify({ tipo: 'hola', pendientes: loadPrintQueue().filter((t) => t.estado === 'pendiente').length })}\n\n`);
+
+  const latido = setInterval(() => {
+    try {
+      res.write(': ping\n\n');
+      estadoAgente.ultimaConexion = new Date().toISOString();
+    } catch {
+      /* ver 'close' */
+    }
+  }, SSE_HEARTBEAT_MS);
+
+  req.on('close', () => {
+    clearInterval(latido);
+    agentesConectados.delete(res);
+  });
+});
+
+// Qué impresora usar. El agente lo relee en cada trabajo, así un cambio desde el panel surte efecto
+// sin reiniciar nada en la tienda.
+app.get('/api/print/config', requireAgenteImpresion, (req, res) => {
+  const c = loadPrintConfig();
+  res.json({ activo: c.activo, modo: c.modo, ip: c.ip, puerto: c.puerto, nombreCola: c.nombreCola });
+});
+
+// Los trabajos que faltan por imprimir, del más viejo al más nuevo: el orden en que entraron los
+// pedidos es el orden en que conviene atenderlos.
+app.get('/api/print/jobs', requireAgenteImpresion, (req, res) => {
+  estadoAgente.ultimaConexion = new Date().toISOString();
+  const pendientes = loadPrintQueue()
+    .filter((t) => t.estado === 'pendiente')
+    .map((t) => ({ id: t.id, orderId: t.orderId, motivo: t.motivo, creado: t.creado }));
+  res.json(pendientes);
+});
+
+/**
+ * Los bytes ESC/POS de un trabajo.
+ *
+ * **Pedirlos marca el trabajo como `imprimiendo`**, y solo se entregan si estaba `pendiente`. Es lo
+ * que impide que dos agentes —o el mismo tras un reintento— saquen el mismo recibo dos veces.
+ */
+app.get('/api/print/jobs/:id/bytes', requireAgenteImpresion, (req, res) => {
+  const cola = loadPrintQueue();
+  const trabajo = cola.find((t) => t.id === req.params.id);
+  if (!trabajo) return res.status(404).json({ error: 'Trabajo no encontrado.' });
+  if (trabajo.estado !== 'pendiente') {
+    return res.status(409).json({ error: `El trabajo ya está en estado "${trabajo.estado}".` });
+  }
+
+  const pedido = trabajo.motivo === 'prueba'
+    ? pedidoDePrueba()
+    : loadOrdersLocation().find((o) => o.orderId === trabajo.orderId);
+  if (!pedido) {
+    trabajo.estado = 'error';
+    trabajo.error = 'El pedido ya no existe.';
+    trabajo.terminadoEn = new Date().toISOString();
+    savePrintQueue(cola);
+    return res.status(404).json({ error: 'El pedido ya no existe.' });
+  }
+
+  const config = loadPrintConfig();
+  let bytes;
+  try {
+    bytes = construirRecibo(pedido, config);
+  } catch (err) {
+    trabajo.estado = 'error';
+    trabajo.error = `No se pudo componer el recibo: ${err.message}`;
+    trabajo.terminadoEn = new Date().toISOString();
+    savePrintQueue(cola);
+    return res.status(500).json({ error: trabajo.error });
+  }
+
+  trabajo.estado = 'imprimiendo';
+  trabajo.entregadoEn = new Date().toISOString();
+  savePrintQueue(cola);
+  estadoAgente.ultimaConexion = trabajo.entregadoEn;
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.send(bytes);
+});
+
+// El agente cuenta cómo le fue. Hasta que llega esto, el trabajo se queda en `imprimiendo`.
+app.post('/api/print/jobs/:id/resultado', requireAgenteImpresion, (req, res) => {
+  const cola = loadPrintQueue();
+  const trabajo = cola.find((t) => t.id === req.params.id);
+  if (!trabajo) return res.status(404).json({ error: 'Trabajo no encontrado.' });
+
+  const ok = req.body && req.body.ok === true;
+  trabajo.estado = ok ? 'impreso' : 'error';
+  trabajo.error = ok ? null : String((req.body && req.body.error) || 'Error desconocido en el agente.').slice(0, 300);
+  trabajo.terminadoEn = new Date().toISOString();
+  savePrintQueue(cola);
+  estadoAgente.ultimaConexion = trabajo.terminadoEn;
+  if (!ok) console.error(`Impresión fallida (${trabajo.orderId}): ${trabajo.error}`);
+  res.json({ ok: true });
+});
+
+// Latido con lo que el agente ve. Las impresoras que reporta son las que el panel ofrece en la
+// lista: es preferible a que el dueño escriba un nombre a mano y se equivoque en un espacio.
+app.post('/api/print/agente', requireAgenteImpresion, (req, res) => {
+  estadoAgente = {
+    ultimaConexion: new Date().toISOString(),
+    impresorasVistas: Array.isArray(req.body && req.body.impresoras)
+      ? req.body.impresoras.map((x) => String(x).slice(0, 120)).slice(0, 40)
+      : estadoAgente.impresorasVistas,
+    version: req.body && req.body.version ? String(req.body.version).slice(0, 20) : estadoAgente.version,
+  };
+  res.json({ ok: true });
+});
+
+// --- Pedido de prueba --------------------------------------------------------------------------
+// Datos inventados a propósito y marcados como tales: sirve para ver si la impresora responde y si
+// el papel sale bien cortado, sin tener que esperar una venta real.
+function pedidoDePrueba() {
+  return {
+    orderId: 'PRUEBA',
+    createdAt: new Date().toISOString(),
+    nombre: 'Impresion de prueba',
+    deliveryMethod: 'Retiro en tienda',
+    paymentMethod: 'Prueba',
+    items: [
+      { id: 'TEST1', title: 'Si lees esto, la impresora funciona', price: 1, quantity: 1 },
+      { id: 'TEST2', title: 'Revisa que el papel corte bien', price: 2, quantity: 2 },
+    ],
+    total: 5,
+  };
+}
+
+// --- Endpoints del PANEL -----------------------------------------------------------------------
+
+function estadoDeImpresion() {
+  const cola = loadPrintQueue();
+  const ultimos = cola.slice(-25).reverse();
+  const desde = estadoAgente.ultimaConexion ? Date.now() - new Date(estadoAgente.ultimaConexion).getTime() : null;
+  return {
+    config: loadPrintConfig(),
+    // Sin token no hay agente posible: el panel debe decirlo claro en vez de mostrar "desconectado"
+    // y dejar al dueño buscando el problema en la tienda.
+    tokenConfigurado: Boolean(PRINT_AGENT_TOKEN),
+    agente: {
+      conectado: agentesConectados.size > 0,
+      ultimaConexion: estadoAgente.ultimaConexion,
+      // Un agente que no da señales en dos minutos está caído: el latido va cada 25 segundos.
+      silencioSegundos: desde === null ? null : Math.round(desde / 1000),
+      impresorasVistas: estadoAgente.impresorasVistas,
+      version: estadoAgente.version,
+    },
+    pendientes: cola.filter((t) => t.estado === 'pendiente').length,
+    atascados: cola.filter((t) => t.estado === 'imprimiendo').length,
+    conError: cola.filter((t) => t.estado === 'error').length,
+    ultimos,
+  };
+}
+
+app.get('/api/admin/print', requireAdminRole('master'), (req, res) => {
+  res.json(estadoDeImpresion());
+});
+
+app.put('/api/admin/print/config', requireAdminRole('master'), (req, res) => {
+  const actual = loadPrintConfig();
+  const body = req.body || {};
+  const entero = (v, def, min, max) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : def;
+  };
+  const nueva = {
+    activo: body.activo === undefined ? actual.activo : Boolean(body.activo),
+    anchoPapel: body.anchoPapel === undefined ? actual.anchoPapel : (Number(body.anchoPapel) === 58 ? 58 : 80),
+    acentos: body.acentos === undefined ? actual.acentos : Boolean(body.acentos),
+    cortar: body.cortar === undefined ? actual.cortar : Boolean(body.cortar),
+    copias: body.copias === undefined ? actual.copias : entero(body.copias, actual.copias, 1, 3),
+    modo: body.modo === 'windows' ? 'windows' : (body.modo === 'red' ? 'red' : actual.modo),
+    // Se valida la forma de la IP acá y no solo en la pantalla: una IP mal escrita deja al agente
+    // reintentando contra la nada y el síntoma que se ve es "no imprime", que no dice dónde mirar.
+    ip: body.ip === undefined ? actual.ip : String(body.ip).trim().slice(0, 45),
+    puerto: body.puerto === undefined ? actual.puerto : entero(body.puerto, actual.puerto, 1, 65535),
+    nombreCola: body.nombreCola === undefined ? actual.nombreCola : String(body.nombreCola).trim().slice(0, 120),
+  };
+  if (nueva.modo === 'red' && nueva.ip && !/^(\d{1,3}\.){3}\d{1,3}$/.test(nueva.ip)) {
+    return res.status(400).json({ error: 'La dirección IP no tiene un formato válido (ej. 192.168.1.50).' });
+  }
+  if (nueva.activo && nueva.modo === 'red' && !nueva.ip) {
+    return res.status(400).json({ error: 'Falta la dirección IP de la impresora.' });
+  }
+  if (nueva.activo && nueva.modo === 'windows' && !nueva.nombreCola) {
+    return res.status(400).json({ error: 'Falta elegir la impresora de la lista.' });
+  }
+  savePrintConfig(nueva);
+  // El agente relee la configuración en cada trabajo, pero avisarle evita que el primer recibo tras
+  // el cambio salga por la impresora vieja.
+  avisarAgentes({ tipo: 'config' });
+  res.json(estadoDeImpresion());
+});
+
+app.post('/api/admin/print/prueba', requireAdminRole('master'), (req, res) => {
+  const config = loadPrintConfig();
+  if (!config.activo) return res.status(400).json({ error: 'La impresión está apagada. Actívala primero.' });
+  const trabajo = encolarImpresion('PRUEBA', 'prueba');
+  if (!trabajo) return res.status(500).json({ error: 'No se pudo encolar la prueba.' });
+  res.json({ ok: true, id: trabajo.id, agenteConectado: agentesConectados.size > 0 });
+});
+
+app.post('/api/admin/print/reimprimir/:orderId', requireAdminRole('master'), (req, res) => {
+  const pedido = loadOrdersLocation().find((o) => o.orderId === req.params.orderId);
+  if (!pedido) return res.status(404).json({ error: 'Pedido no encontrado.' });
+  const trabajo = encolarImpresion(pedido.orderId, 'reimpresion');
+  if (!trabajo) return res.status(400).json({ error: 'La impresión está apagada. Actívala primero.' });
+  res.json({ ok: true, id: trabajo.id, agenteConectado: agentesConectados.size > 0 });
+});
+
+// Un trabajo atascado en `imprimiendo` vuelve a `pendiente` — pero lo decide una persona, después
+// de mirar si el recibo salió o no. Automatizarlo es exactamente cómo se imprime dos veces.
+app.post('/api/admin/print/reintentar/:id', requireAdminRole('master'), (req, res) => {
+  const cola = loadPrintQueue();
+  const trabajo = cola.find((t) => t.id === req.params.id);
+  if (!trabajo) return res.status(404).json({ error: 'Trabajo no encontrado.' });
+  if (trabajo.estado === 'impreso') return res.status(409).json({ error: 'Ese trabajo ya se imprimió.' });
+  trabajo.estado = 'pendiente';
+  trabajo.error = null;
+  trabajo.entregadoEn = null;
+  trabajo.terminadoEn = null;
+  savePrintQueue(cola);
+  avisarAgentes({ tipo: 'trabajo', id: trabajo.id });
+  res.json({ ok: true, agenteConectado: agentesConectados.size > 0 });
+});
+
+// El recibo en texto, para verlo en pantalla sin gastar papel. Sale del mismo código que compone lo
+// que se imprime, así que no puede desfasarse (ver escpos-recibo.js).
+app.get('/api/admin/print/vista-previa', requireAdminRole('master'), (req, res) => {
+  const config = loadPrintConfig();
+  const pedido = req.query.orderId
+    ? loadOrdersLocation().find((o) => o.orderId === req.query.orderId)
+    : pedidoDePrueba();
+  if (!pedido) return res.status(404).json({ error: 'Pedido no encontrado.' });
+  res.json({ texto: previsualizarRecibo(pedido, config), anchoPapel: config.anchoPapel });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Inventory backend listening on port ${PORT}`));
