@@ -2212,11 +2212,15 @@ app.post('/api/cart/check', async (req, res) => {
     // Un precio en cero no es una rebaja: es un producto mal cargado. Se trata como agotado, o el
     // cliente completaría el pedido pagando nada — y saldría "correcto", porque el precio lo toma
     // el servidor del catálogo.
-    if (!p.price || Number(p.price) <= 0) {
-      return { id, title: titulo, pedido: quantity, disponible: 0, estado: 'agotado' };
-    }
+    // Sin conteo en PLADE ya NO se vende. Antes eran venta libre; por decisión del dueño ahora
+    // esperan a tener inventario de verdad, y se activan solos en cuanto PLADE les dé existencia.
     if (p.stock === null || p.stock === undefined) {
-      return { id, title: titulo, pedido: quantity, disponible: null, estado: 'ok' };
+      return { id, title: titulo, pedido: quantity, disponible: 0, estado: 'proximamente' };
+    }
+    // Un precio en cero no es una rebaja: es una ficha a medio cargar. Se avisa como "próximamente"
+    // y no como "agotado" porque decir que se agotó algo que sí está en el almacén sería mentir.
+    if (!p.price || Number(p.price) <= 0) {
+      return { id, title: titulo, pedido: quantity, disponible: 0, estado: 'proximamente' };
     }
     // Se descuenta lo ya comprometido por pedidos que PLADE todavía no procesó, igual que en la
     // creación del pedido: si no, dos personas se llevarían la misma última unidad.
@@ -3662,16 +3666,20 @@ app.post('/api/orders', (req, res) => {
   const ajustesStock = loadStockAdjustments();
   const agotados = [];
   const insuficientes = [];
+  const proximamente = [];
   for (const item of normalizedItems) {
     const delCatalogo = catalogoPorId.get(item.id);
     if (!delCatalogo) continue;
-    // Sin precio no se vende. Va antes que el stock porque es motivo suficiente por sí solo, y
-    // aplica también a los productos de los que PLADE no lleva la cuenta.
-    if (!delCatalogo.price || Number(delCatalogo.price) <= 0) {
-      agotados.push({ id: item.id, title: item.title });
+    // Sin conteo en PLADE, o sin precio: no se vende. Se reportan aparte de los agotados porque no
+    // es lo mismo "se acabó" que "todavía no está a la venta".
+    if (delCatalogo.stock === null || delCatalogo.stock === undefined) {
+      proximamente.push({ id: item.id, title: item.title });
       continue;
     }
-    if (delCatalogo.stock === null || delCatalogo.stock === undefined) continue;
+    if (!delCatalogo.price || Number(delCatalogo.price) <= 0) {
+      proximamente.push({ id: item.id, title: item.title });
+      continue;
+    }
     const disponible = unidadesComprables(applyPendingStock(Number(delCatalogo.stock) || 0, item.id, ajustesStock));
     if (disponible <= 0) {
       agotados.push({ id: item.id, title: item.title });
@@ -3680,19 +3688,25 @@ app.post('/api/orders', (req, res) => {
     }
   }
 
-  if (agotados.length > 0 || insuficientes.length > 0) {
+  if (agotados.length > 0 || insuficientes.length > 0 || proximamente.length > 0) {
     console.error(
       `Pedido rechazado por stock. Agotados: ${agotados.map((x) => x.id).join(', ') || 'ninguno'}. ` +
-        `Insuficientes: ${insuficientes.map((x) => `${x.id} (pide ${x.pedido}, hay ${x.disponible})`).join(', ') || 'ninguno'}.`
+        `Insuficientes: ${insuficientes.map((x) => `${x.id} (pide ${x.pedido}, hay ${x.disponible})`).join(', ') || 'ninguno'}. ` +
+        `Todavía no a la venta: ${proximamente.map((x) => x.id).join(', ') || 'ninguno'}.`
     );
     // 409: el pedido está bien formado, pero el mundo cambió desde que se armó el carrito.
+    let mensaje;
+    if (agotados.length > 0) {
+      mensaje = `Se agotó ${agotados.length === 1 ? 'un producto de tu carrito' : 'más de un producto de tu carrito'} mientras comprabas.`;
+    } else if (proximamente.length > 0) {
+      mensaje = `${proximamente.length === 1 ? 'Un producto de tu carrito' : 'Algunos productos de tu carrito'} todavía no está${proximamente.length === 1 ? '' : 'n'} a la venta.`;
+    } else {
+      mensaje = 'No queda suficiente cantidad de algún producto de tu carrito.';
+    }
     return res.status(409).json({
-      error:
-        agotados.length > 0
-          ? `Se agotó ${agotados.length === 1 ? 'un producto de tu carrito' : 'más de un producto de tu carrito'} mientras comprabas.`
-          : 'No queda suficiente cantidad de algún producto de tu carrito.',
+      error: mensaje,
       // El detalle permite que la tienda diga QUÉ pasó con cada producto en vez de un error vago.
-      agotados,
+      agotados: agotados.concat(proximamente),
       insuficientes,
     });
   }
