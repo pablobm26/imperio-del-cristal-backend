@@ -2376,6 +2376,50 @@ app.post('/api/visit', (req, res) => {
   }
 });
 
+/**
+ * Repara los países mal registrados: los pasa a `??` (Sin determinar).
+ *
+ * Hasta el commit 5ff78be el país se leía de `cf-ipcountry`, que Cloudflare sella con el país de
+ * QUIEN LLAMA a Render — el centro de datos de Vercel, en Estados Unidos. Todas las visitas
+ * quedaron marcadas como US sin importar de dónde entrara la persona.
+ *
+ * NO se borran las visitas: ocurrieron de verdad y sus páginas, horas, aparatos y orígenes son
+ * correctos. Lo único falso es la etiqueta de país, así que se sustituye por "no se sabe" en vez de
+ * tirar datos buenos. Pasarlas a `??` además mantiene la cuenta cuadrada: si se borrara el desglose,
+ * la suma por país no llegaría al total de páginas y los porcentajes mentirían.
+ *
+ * Va por día porque los datos se guardan por día: no hay forma de separar, dentro de la jornada en
+ * que se desplegó el arreglo, las visitas de antes de las de después.
+ */
+app.post('/api/admin/visits/reparar-paises', requireAdminRole('admin'), (req, res) => {
+  if (req.adminRole !== 'master') {
+    return res.status(403).json({ error: 'Solo una cuenta Master puede tocar los datos de visitas.' });
+  }
+
+  const hasta = String((req.body && req.body.hasta) || claveDelDia(Date.now()));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(hasta)) {
+    return res.status(400).json({ error: 'Fecha no válida.' });
+  }
+
+  const visitas = loadVisits();
+  let diasTocados = 0;
+  let vistasReetiquetadas = 0;
+
+  for (const [dia, d] of Object.entries(visitas)) {
+    if (dia > hasta || !d || !d.paises) continue;
+    const total = Object.values(d.paises).reduce((a, b) => a + (Number(b) || 0), 0);
+    // Si el día ya está entero como desconocido, no hay nada que reparar.
+    if (total === 0 || (Object.keys(d.paises).length === 1 && d.paises['??'] === total)) continue;
+    d.paises = { '??': total };
+    diasTocados += 1;
+    vistasReetiquetadas += total;
+  }
+
+  if (diasTocados > 0) saveVisits(visitas);
+  console.log(`Países de visitas reparados por ${req.adminUser.username}: ${diasTocados} días, ${vistasReetiquetadas} páginas hasta ${hasta}.`);
+  res.json({ ok: true, diasTocados, vistasReetiquetadas, hasta });
+});
+
 app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
   if (req.adminRole !== 'master') {
     return res.status(403).json({ error: 'Solo una cuenta Master puede ver las visitas del sitio.' });
