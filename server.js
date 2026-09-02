@@ -805,7 +805,15 @@ function getMergedProducts() {
 // de comportamiento para quien no tenga PLADE conectado). Escribe directo a PRODUCTS_FILE, así que
 // el resto del backend (getMergedProducts, /api/products, /api/categories) no necesita saber de
 // dónde vino el catálogo.
-const PLADE_SYNC_INTERVAL_MS = 30 * 60 * 1000; // cada 30 min alcanza para un catálogo que no cambia segundo a segundo
+// Cada 8 minutos. Eran 30, con el argumento de que el catálogo no cambia segundo a segundo — pero
+// el que sí cambia es el STOCK: una venta en el mostrador físico puede dejar un producto en cero, y
+// hasta la siguiente sincronización la tienda lo seguía ofreciendo. Ese hueco era de media hora.
+//
+// Coste real medido: PLADE devuelve el catálogo completo (2,4 MB) en 0,4-1 s. Pasar de 2 a 7
+// consultas por hora no es carga apreciable para su sistema, y recorta el hueco a menos de diez
+// minutos. Bajar mucho más no compensa: la comprobación del checkout ya consulta EN VIVO, así que
+// nadie llega a pagar algo agotado aunque lo vea disponible un rato en el catálogo.
+const PLADE_SYNC_INTERVAL_MS = 8 * 60 * 1000;
 let lastPladeSync = null; // { at: string, count: number } | { at: string, error: string }
 
 async function syncProductsFromPlade() {
