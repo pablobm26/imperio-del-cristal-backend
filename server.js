@@ -3496,19 +3496,41 @@ app.get('/api/products/batch', (req, res) => {
 // carrito o ya vio. Con `maxStock` filtra a solo productos con poco stock (0 < stock < maxStock),
 // para el rail de "Últimas unidades" — sin este parámetro, cualquier producto con stock cuenta.
 // También tiene que ir ANTES de /api/products/:id.
+// Cuántos de los mejor surtidos entran en el sorteo cuando se pide `orden=mas-stock`. Se sortea
+// entre ellos en vez de mostrar los 8 primeros a secas: si no, TODOS los clientes verían siempre
+// los mismos ocho productos y el rail dejaría de ser una sugerencia para ser un cartel fijo.
+const ANCHO_MAS_STOCK = 100;
+
 app.get('/api/products/random', (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 6, 1), 20);
   const exclude = new Set(String(req.query.exclude || '').split(',').map((s) => s.trim()).filter(Boolean));
   const maxStock = req.query.maxStock ? Math.max(1, parseInt(req.query.maxStock, 10) || 0) : null;
+  // `orden=mas-stock`: sugerir lo que sobra, no lo que se está acabando. Lo pidió el dueño el
+  // 2026-09-02 — en el paso de pago las sugerencias salían casi todas con el aviso rojo de "últimas
+  // unidades", que al lado del botón de pagar transmite una tienda vaciándose.
+  const masStock = req.query.orden === 'mas-stock';
+
   const pool = soloCategoriasActivas(getMergedProducts()).filter((p) => {
     if (exclude.has(p.id) || !p.image) return false;
-    if (maxStock !== null) return p.stock !== null && p.stock > 0 && p.stock < maxStock;
-    return p.stock === null || p.stock > 0;
+    // Solo lo que el cliente puede comprar DE VERDAD. Antes entraban los de `stock === null` y los
+    // de precio 0: desde que esos salen como "Disponible próximamente" (ver 2.32), sugerirlos era
+    // ofrecer en la caja algo que no se puede meter al carrito.
+    if (!p.price || Number(p.price) <= 0) return false;
+    const unidades = unidadesComprables(p.stock);
+    if (unidades === null || unidades < 1) return false;
+    if (maxStock !== null) return unidades < maxStock;
+    return true;
   });
+
+  // Se sortea sobre una copia: `splice` va vaciando el arreglo y no debe tocar el pool original.
+  const candidatos = masStock
+    ? [...pool].sort((a, b) => Number(b.stock) - Number(a.stock)).slice(0, ANCHO_MAS_STOCK)
+    : [...pool];
+
   const picked = [];
-  while (picked.length < limit && pool.length > 0) {
-    const i = Math.floor(Math.random() * pool.length);
-    picked.push(pool.splice(i, 1)[0]);
+  while (picked.length < limit && candidatos.length > 0) {
+    const i = Math.floor(Math.random() * candidatos.length);
+    picked.push(candidatos.splice(i, 1)[0]);
   }
   res.json(picked);
 });
