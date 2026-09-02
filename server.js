@@ -838,6 +838,24 @@ function getMergedProducts() {
  * la configuración se pierde o se corrompe: preferible mostrar de más y que el chequeo del carrito
  * lo corrija, a mostrar de menos y dejar de vender mercancía que sí hay.
  */
+/**
+ * Sedes que el dueño escondió de la lista del panel.
+ *
+ * Es SOLO presentación: una sede oculta que estuviera seleccionada seguiría aportando su stock, y
+ * eso sería un estado imposible de entender después. Por eso al guardar se descarta de las ocultas
+ * cualquiera que esté en uso — la invariante se aplica en el servidor y no solo en la pantalla.
+ */
+function sucursalesOcultas() {
+  try {
+    const c = inventoryConfigStore.load();
+    const ocultas = normalizarSucursales(Array.isArray(c && c.ocultas) ? c.ocultas : []);
+    const enUso = sucursalesDeInventario();
+    return ocultas.filter((id) => !enUso.includes(id));
+  } catch {
+    return [];
+  }
+}
+
 function sucursalesDeInventario() {
   try {
     const c = inventoryConfigStore.load();
@@ -4496,6 +4514,7 @@ const SUCURSALES_CONOCIDAS = [
 app.get('/api/admin/inventario/sedes', requireAdminRole('master'), (req, res) => {
   res.json({
     seleccionadas: sucursalesDeInventario(),
+    ocultas: sucursalesOcultas(),
     conocidas: SUCURSALES_CONOCIDAS,
     pladeConectado: isPladeConfigured(),
     ultimaSync: lastPladeSync,
@@ -4534,7 +4553,9 @@ app.put('/api/admin/inventario/sedes', requireAdminRole('master'), async (req, r
 
   // Se guarda YA normalizado: si alguien mandara "1|5" —que PLADE acepta quedándose con una sola
   // sede, sin error— queda descartado acá y no llega nunca al archivo.
-  inventoryConfigStore.save({ sucursales: ids, actualizado: new Date().toISOString() });
+  // Una sede que pasa a estar EN USO deja de estar oculta: no puede aportar stock desde la sombra.
+  const ocultas = sucursalesOcultas().filter((id) => !ids.includes(id));
+  inventoryConfigStore.save({ sucursales: ids, ocultas, actualizado: new Date().toISOString() });
   console.log(`Sedes de inventario: ${ids.length === 0 ? 'todas' : ids.join(' + ')}`);
 
   // Se resincroniza en el acto: sin esto el catálogo seguiría mostrando el stock viejo hasta ocho
@@ -4551,6 +4572,27 @@ app.put('/api/admin/inventario/sedes', requireAdminRole('master'), async (req, r
     }
   }
   res.json({ seleccionadas: ids, sincronizado, errorSync });
+});
+
+/**
+ * Ocultar sedes de la lista del panel.
+ *
+ * Endpoint aparte del de selección **a propósito**: esconder una sede no cambia el inventario, así
+ * que no tiene por qué disparar una resincronización con PLADE (dos consultas de 2,4 MB) solo para
+ * acortar una lista en pantalla.
+ */
+app.put('/api/admin/inventario/sedes/ocultas', requireAdminRole('master'), (req, res) => {
+  const enUso = sucursalesDeInventario();
+  const pedidas = normalizarSucursales((req.body && req.body.ocultas) || []);
+  const invalidas = pedidas.filter((id) => enUso.includes(id));
+  if (invalidas.length > 0) {
+    return res.status(400).json({
+      error: `No se puede ocultar una sede que está en uso (${invalidas.join(', ')}). Desmarcala primero.`,
+    });
+  }
+  const actual = inventoryConfigStore.load() || {};
+  inventoryConfigStore.save({ ...actual, ocultas: pedidas, actualizado: new Date().toISOString() });
+  res.json({ ocultas: pedidas });
 });
 
 // ===========================================================================================
