@@ -4534,6 +4534,29 @@ function commitEnEjecucion() {
 const COMMIT = commitEnEjecucion();
 const ARRANCADO = new Date().toISOString();
 
+/**
+ * Qué migraciones opcionales ve la base, comprobado UNA vez al arrancar.
+ *
+ * El dueño corre las migraciones a mano, y hasta ahora la única forma de saber si una se corrió era
+ * entrar al panel e intentar la acción. Con esto se ve desde fuera y sin credenciales — igual que el
+ * commit. Cuesta una consulta al arrancar y cero por petición.
+ *
+ * `null` significa "no sé" (Supabase sin configurar), que no es lo mismo que "falta".
+ */
+let COLUMNAS_EN_BASE = null;
+adminUsers
+  .columnasDisponibles()
+  .then((c) => {
+    COLUMNAS_EN_BASE = c;
+    if (c) {
+      const faltan = Object.entries(c).filter(([, existe]) => !existe).map(([k]) => k);
+      console.log(faltan.length === 0
+        ? 'Esquema de admin_users al día.'
+        : `OJO: faltan migraciones en admin_users -> ${faltan.join(', ')}`);
+    }
+  })
+  .catch((err) => console.error('No se pudo comprobar el esquema de admin_users:', err.message));
+
 // El SHA de un repositorio privado no abre ninguna puerta: no dice qué hay dentro y no sirve para
 // autenticarse. A cambio ahorra la adivinanza en cada despliegue.
 app.get('/api/health', (req, res) => res.json({
@@ -4542,6 +4565,9 @@ app.get('/api/health', (req, res) => res.json({
   arrancado: ARRANCADO,
   // Segundos en pie. Un número chico justo después de un push es la señal de que el deploy entró.
   segundosEnPie: Math.round(process.uptime()),
+  // Qué columnas opcionales ve la base. Sirve para saber si una migración se corrió sin tener que
+  // entrar al panel. Son nombres de columna, no datos de nadie.
+  esquema: COLUMNAS_EN_BASE,
 }));
 
 // ===========================================================================================

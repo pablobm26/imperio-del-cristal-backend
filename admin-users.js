@@ -181,6 +181,32 @@ async function permisosFrescos(id) {
   };
 }
 
+/**
+ * Qué columnas opcionales tiene la base HOY.
+ *
+ * Existe porque el problema se repite: el dueño corre las migraciones a mano, y hasta ahora la única
+ * forma de saber si una se corrió era entrar al panel e intentar la acción. Peor, la ordenación
+ * equivocada entre deploy y migración ya provocó un apagón total del panel (2026-08-09).
+ *
+ * Se consulta UNA vez al arrancar y el resultado va a `/api/health`. Cero coste por petición y una
+ * respuesta clara a "¿ya corrí esa migración?" sin necesitar credenciales.
+ *
+ * Devuelve `null` (no `false`) cuando no hay Supabase configurado: "no sé" y "no está" son cosas
+ * distintas, y confundirlas mandaría a alguien a correr una migración que quizá ya corrió.
+ */
+async function columnasDisponibles() {
+  if (!isAdminUsersConfigured()) return null;
+  const estado = {};
+  for (const columna of COLUMNAS_OPCIONALES) {
+    // `limit(0)`: pide la columna sin traerse ninguna fila. Confirma que existe sin leer datos de
+    // nadie, que es justo lo que hace falta acá.
+    const { error } = await supabaseAdmin.from('admin_users').select(columna).limit(0);
+    if (error && isMissingTable(error)) return null;
+    estado[columna] = !isMissingColumn(error);
+  }
+  return estado;
+}
+
 /** Compara la contraseña contra el hash bcrypt. Nunca compara texto plano. */
 async function verifyPassword(plain, hash) {
   if (!plain || !hash) return false;
@@ -349,6 +375,7 @@ module.exports = {
   normalizeUsername,
   findActiveUser,
   permisosFrescos,
+  columnasDisponibles,
   verifyPassword,
   touchLastLogin,
   listUsers,
