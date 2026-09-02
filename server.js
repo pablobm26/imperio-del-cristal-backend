@@ -2241,19 +2241,26 @@ function paisDeLaPeticion(req) {
 }
 
 /**
- * Estado del visitante DENTRO de Venezuela. Vercel manda el código ISO 3166-2 sin el prefijo del
- * país: para Venezuela son letras sueltas ("G" = Carabobo).
+ * Estado o región del visitante. Vercel manda el código ISO 3166-2 sin el prefijo del país.
  *
- * Solo se guarda cuando el país es VE: el estado de un visitante de Colombia o España no le dice
- * nada al dueño y multiplicaría las claves del archivo sin motivo.
+ * Solo se sigue a los TRES PAÍSES a los que vende la tienda — Venezuela, Colombia y Estados
+ * Unidos. La región de un visitante de España no le dice nada al dueño y multiplicaría las claves
+ * del archivo sin motivo.
+ *
+ * Se guarda CON el prefijo del país (`VE-G`, `US-GA`). El prefijo no es decorativo: sin él, "G"
+ * sería Carabobo y Georgia a la vez, y "S" Táchira y Carolina del Sur.
  */
+const PAISES_CON_REGION = new Set(['VE', 'CO', 'US']);
+
 function regionDeLaPeticion(req, pais) {
-  if (pais !== 'VE') return null;
-  const crudo = String(req.headers['x-region'] || req.headers['x-vercel-ip-country-region'] || '').trim().toUpperCase();
-  // Se acepta tanto "G" como "VE-G", que es como lo mandan algunas redes.
-  const limpio = crudo.startsWith('VE-') ? crudo.slice(3) : crudo;
+  if (!PAISES_CON_REGION.has(pais)) return null;
+  const crudo = String(req.headers['x-region'] || req.headers['x-vercel-ip-country-region'] || '')
+    .trim()
+    .toUpperCase();
+  // Algunas redes lo mandan ya prefijado ("VE-G"): se quita para volver a ponerlo de forma uniforme.
+  const limpio = crudo.startsWith(`${pais}-`) ? crudo.slice(3) : crudo;
   if (!/^[A-Z0-9]{1,3}$/.test(limpio)) return null;
-  return limpio;
+  return `${pais}-${limpio}`;
 }
 
 // Los buscadores y los previsualizadores de enlaces (WhatsApp, Facebook) NO son visitas de
