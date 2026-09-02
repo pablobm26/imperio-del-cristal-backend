@@ -723,6 +723,19 @@ function mergeProductWithDetails(product, details) {
 // Resta lo pendiente de stock_adjustments.json (ventas online que PLADE todavía no procesó) sobre
 // el stock crudo — ver adjustStock()/replaceProductsCatalog() más arriba. No toca stock null (no
 // rastreado).
+/**
+ * Unidades ENTERAS que se pueden comprar de un stock que puede traer decimales.
+ *
+ * El catálogo conserva los decimales de PLADE (81,34 metros de paracord), pero el carrito trabaja
+ * en unidades enteras. Sin redondear hacia abajo, un rollo con 0,8 metros se ofrecía, el cliente
+ * pedía 1, el servidor lo rechazaba, y el botón de "dejar 0,8" volvía a mandar 1: un bucle.
+ */
+function unidadesComprables(stock) {
+  if (stock === null || stock === undefined) return null;
+  const n = Number(stock);
+  return Number.isFinite(n) ? Math.floor(n) : null;
+}
+
 function applyPendingStock(stock, productId, adjustments) {
   const pending = adjustments[productId];
   if (!pending || stock === null || stock === undefined) return stock;
@@ -2196,12 +2209,18 @@ app.post('/api/cart/check', async (req, res) => {
     const p = porId.get(id);
     if (!p) return { id, title: id, pedido: quantity, disponible: 0, estado: 'no_existe' };
     const titulo = p.title || id;
+    // Un precio en cero no es una rebaja: es un producto mal cargado. Se trata como agotado, o el
+    // cliente completaría el pedido pagando nada — y saldría "correcto", porque el precio lo toma
+    // el servidor del catálogo.
+    if (!p.price || Number(p.price) <= 0) {
+      return { id, title: titulo, pedido: quantity, disponible: 0, estado: 'agotado' };
+    }
     if (p.stock === null || p.stock === undefined) {
       return { id, title: titulo, pedido: quantity, disponible: null, estado: 'ok' };
     }
     // Se descuenta lo ya comprometido por pedidos que PLADE todavía no procesó, igual que en la
     // creación del pedido: si no, dos personas se llevarían la misma última unidad.
-    const disponible = applyPendingStock(Number(p.stock) || 0, id, ajustes);
+    const disponible = unidadesComprables(applyPendingStock(Number(p.stock) || 0, id, ajustes));
     if (disponible <= 0) return { id, title: titulo, pedido: quantity, disponible: 0, estado: 'agotado' };
     if (quantity > disponible) return { id, title: titulo, pedido: quantity, disponible, estado: 'insuficiente' };
     return { id, title: titulo, pedido: quantity, disponible, estado: 'ok' };
@@ -3645,8 +3664,15 @@ app.post('/api/orders', (req, res) => {
   const insuficientes = [];
   for (const item of normalizedItems) {
     const delCatalogo = catalogoPorId.get(item.id);
-    if (!delCatalogo || delCatalogo.stock === null || delCatalogo.stock === undefined) continue;
-    const disponible = applyPendingStock(Number(delCatalogo.stock) || 0, item.id, ajustesStock);
+    if (!delCatalogo) continue;
+    // Sin precio no se vende. Va antes que el stock porque es motivo suficiente por sí solo, y
+    // aplica también a los productos de los que PLADE no lleva la cuenta.
+    if (!delCatalogo.price || Number(delCatalogo.price) <= 0) {
+      agotados.push({ id: item.id, title: item.title });
+      continue;
+    }
+    if (delCatalogo.stock === null || delCatalogo.stock === undefined) continue;
+    const disponible = unidadesComprables(applyPendingStock(Number(delCatalogo.stock) || 0, item.id, ajustesStock));
     if (disponible <= 0) {
       agotados.push({ id: item.id, title: item.title });
     } else if (item.quantity > disponible) {

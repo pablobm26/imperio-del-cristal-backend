@@ -49,14 +49,36 @@ async function getInventario() {
  * así reseñas y specs manuales guardadas por ID siguen aplicando). `id_plade` se conserva aparte
  * porque savePedidoExterno lo pedirá como `idp` al armar un pedido (fase siguiente, no implementada).
  */
+/**
+ * Normaliza la existencia que manda PLADE.
+ *
+ * Antes se truncaba con Math.trunc, y eso rompía los productos que se venden POR MEDIDA — paracord,
+ * hilo chino, piel de serpiente, cadenas por metro. Un rollo con 0,8 metros quedaba en 0 y la
+ * tienda lo daba por agotado teniendo mercancía; y a 290 productos con fracción se les perdía el
+ * resto en cada sincronización.
+ *
+ * Se redondea a dos decimales, y no más, por un motivo concreto: PLADE devuelve restos de
+ * aritmética de punto flotante como `2.220446049250313e-15` o `-3.55e-15`, que son cero disfrazado.
+ * Sin el redondeo, ese `2.22e-15` es mayor que cero y el producto se ofrecería como disponible.
+ */
+function normalizarExistencia(valor) {
+  if (valor === undefined || valor === null) return null;
+  const n = Number(valor);
+  if (!Number.isFinite(n)) return null;
+  // El corte va contra el valor CRUDO, antes de redondear: si se redondeara primero, un 0,009 se
+  // convertiría en 0,01 y volvería a colarse como mercancía existente.
+  if (Math.abs(n) < 0.01) return 0;
+  return Math.round(n * 100) / 100;
+}
+
 function mapPladeItemToProduct(item) {
-  const existencia = item.existencia !== undefined && item.existencia !== null ? Number(item.existencia) : null;
+  const existencia = normalizarExistencia(item.existencia);
   return {
     id: String(item.codigo_interno ?? item.id_plade ?? '').trim(),
     title: String(item.descripcion ?? '').trim(),
     description: '',
     price: Number(item.precio) || 0,
-    stock: existencia !== null && Number.isFinite(existencia) ? Math.trunc(existencia) : null,
+    stock: existencia,
     category: String(item.categoria ?? 'General').trim() || 'General',
     image: item.imagen ? String(item.imagen).trim() : '',
     width: null,
