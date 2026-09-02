@@ -4361,7 +4361,50 @@ app.get('/api/trm', (req, res) => {
   res.json({ rate: trmRateCache.rate });
 });
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+/**
+ * Qué versión está corriendo de verdad.
+ *
+ * Hizo falta el 2026-09-02: `npx vercel` y el push a Render dicen que salió bien y no hay forma de
+ * comprobar desde fuera si el proceso que responde es el del commit que acabás de subir. Sin esto
+ * la única salida era adivinar por el comportamiento, y cuando el cambio vive detrás del login del
+ * panel no hay comportamiento que mirar.
+ *
+ * `RENDER_GIT_COMMIT` la pone Render sola en el Environment. Fuera de Render se lee de `.git`, y si
+ * tampoco está queda `null`: es un dato de diagnóstico, no una razón para que el health falle.
+ *
+ * Se calcula UNA vez al arrancar. Leer el disco en cada llamada sería trabajo repetido para un dato
+ * que no puede cambiar sin reiniciar el proceso.
+ */
+function commitEnEjecucion() {
+  if (process.env.RENDER_GIT_COMMIT) return process.env.RENDER_GIT_COMMIT.slice(0, 7);
+  try {
+    // Sin child_process: leer los dos archivos es más barato y no depende de que git esté instalado.
+    const cabeza = fs.readFileSync(path.join(__dirname, '.git', 'HEAD'), 'utf8').trim();
+    if (!cabeza.startsWith('ref: ')) return cabeza.slice(0, 7); // HEAD suelto (detached)
+    const ref = cabeza.slice(5).trim();
+    const suelto = path.join(__dirname, '.git', ref);
+    if (fs.existsSync(suelto)) return fs.readFileSync(suelto, 'utf8').trim().slice(0, 7);
+    // Si la rama está empaquetada, su SHA vive en packed-refs y no como archivo propio.
+    const empaquetadas = fs.readFileSync(path.join(__dirname, '.git', 'packed-refs'), 'utf8');
+    const linea = empaquetadas.split(/\r?\n/).find((l) => l.endsWith(` ${ref}`));
+    return linea ? linea.split(' ')[0].slice(0, 7) : null;
+  } catch {
+    return null;
+  }
+}
+
+const COMMIT = commitEnEjecucion();
+const ARRANCADO = new Date().toISOString();
+
+// El SHA de un repositorio privado no abre ninguna puerta: no dice qué hay dentro y no sirve para
+// autenticarse. A cambio ahorra la adivinanza en cada despliegue.
+app.get('/api/health', (req, res) => res.json({
+  ok: true,
+  commit: COMMIT,
+  arrancado: ARRANCADO,
+  // Segundos en pie. Un número chico justo después de un push es la señal de que el deploy entró.
+  segundosEnPie: Math.round(process.uptime()),
+}));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Inventory backend listening on port ${PORT}`));
