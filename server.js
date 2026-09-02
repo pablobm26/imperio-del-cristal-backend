@@ -2103,6 +2103,106 @@ app.get('/api/admin/categories', requireAdminRole('admin'), (req, res) => {
   });
 });
 
+// --- Comprobación del carrito CONTRA PLADE, antes de que el cliente pague ---
+//
+// El checkout cobra por transferencia: el cliente se va del sitio, hace el pago y vuelve a subir la
+// captura. Descubrir ahí que un producto se agotó es descubrirlo TARDE — ya pagó. Por eso esta
+// comprobación va antes, al entrar al paso de pago.
+//
+// Consulta a PLADE EN VIVO, no el catálogo cacheado: la sincronización corre cada 30 minutos y en
+// ese hueco cabe una venta en el mostrador físico que deje el producto en cero.
+
+/** El catálogo de PLADE recién traído, con su momento. Ver por qué existe en pladeFresco(). */
+let inventarioFresco = null;
+const FRESCURA_MS = 15 * 1000;
+
+/**
+ * Trae el inventario de PLADE, reutilizándolo si se pidió hace menos de 15 segundos.
+ *
+ * Los 15 segundos no son un caché de comodidad: son un freno de estampida. Si diez personas están
+ * pagando a la vez, sin esto se dispararían diez descargas del catálogo completo (2,4 MB cada una)
+ * contra el sistema del negocio. A efectos del cliente sigue siendo "en vivo": ninguna venta cambia
+ * el mundo en quince segundos.
+ */
+async function pladeFresco() {
+  if (inventarioFresco && Date.now() - inventarioFresco.at < FRESCURA_MS) return inventarioFresco.porId;
+
+  const items = await getInventario();
+  const productos = items.map(mapPladeItemToProduct).filter((p) => p.id && p.title);
+  const porId = new Map(productos.map((p) => [p.id, p]));
+  inventarioFresco = { at: Date.now(), porId };
+
+  // Además de responder esta comprobación, se APROVECHA para actualizar el catálogo de la tienda.
+  //
+  // Si PLADE acaba de decir que algo está en cero, no tiene sentido que cristal44.com lo siga
+  // ofreciendo durante los minutos que falten para la próxima sincronización: en cuanto un cliente
+  // lo detecta al pagar, el producto pasa a "Agotado" para TODO el mundo.
+  //
+  // Se usa replaceProductsCatalog() y no una escritura directa a propósito: esa función es la que
+  // reconcilia stock_adjustments.json. Escribir el stock a mano descontaría dos veces las ventas
+  // que PLADE ya procesó — el stock nuevo ya las trae restadas, y lo pendiente seguiría restándose
+  // encima.
+  try {
+    replaceProductsCatalog(productos);
+    lastPladeSync = { at: new Date().toISOString(), count: productos.length, motivo: 'checkout' };
+  } catch (err) {
+    // Que falle la actualización del catálogo no debe tumbar la comprobación del carrito, que es
+    // para lo que el cliente está esperando.
+    console.error('No se pudo actualizar el catálogo tras la comprobación de carrito:', err.message);
+  }
+
+  return porId;
+}
+
+app.post('/api/cart/check', async (req, res) => {
+  if (isCartCheckRateLimited(req.ip)) {
+    return res.status(429).json({ error: 'Demasiadas comprobaciones. Esperá un momento.' });
+  }
+
+  const items = Array.isArray(req.body && req.body.items) ? req.body.items.slice(0, 100) : null;
+  if (!items || items.length === 0) {
+    return res.status(400).json({ error: 'No hay productos que comprobar.' });
+  }
+
+  const pedidos = items.map((it) => ({
+    id: String(it && it.id ? it.id : '').trim(),
+    quantity: Math.max(1, Math.trunc(Number(it && it.quantity) || 1)),
+  }));
+
+  let porId;
+  let fuente = 'plade';
+  try {
+    if (!isPladeConfigured()) throw new Error('PLADE no configurado');
+    porId = await pladeFresco();
+  } catch (err) {
+    // PLADE caído o sin configurar: se comprueba contra el último catálogo sincronizado en vez de
+    // bloquear la venta. Se avisa en la respuesta para que la tienda pueda decir que el dato puede
+    // no estar al minuto — mejor una comprobación imperfecta que ninguna.
+    console.error('Comprobación de carrito: no se pudo consultar PLADE, se usa el catálogo local:', err.message);
+    porId = new Map(loadProducts().map((p) => [p.id, p]));
+    fuente = 'local';
+  }
+
+  const ajustes = loadStockAdjustments();
+  const resultado = pedidos.map(({ id, quantity }) => {
+    const p = porId.get(id);
+    if (!p) return { id, title: id, pedido: quantity, disponible: 0, estado: 'no_existe' };
+    const titulo = p.title || id;
+    if (p.stock === null || p.stock === undefined) {
+      return { id, title: titulo, pedido: quantity, disponible: null, estado: 'ok' };
+    }
+    // Se descuenta lo ya comprometido por pedidos que PLADE todavía no procesó, igual que en la
+    // creación del pedido: si no, dos personas se llevarían la misma última unidad.
+    const disponible = applyPendingStock(Number(p.stock) || 0, id, ajustes);
+    if (disponible <= 0) return { id, title: titulo, pedido: quantity, disponible: 0, estado: 'agotado' };
+    if (quantity > disponible) return { id, title: titulo, pedido: quantity, disponible, estado: 'insuficiente' };
+    return { id, title: titulo, pedido: quantity, disponible, estado: 'ok' };
+  });
+
+  const problemas = resultado.filter((r) => r.estado !== 'ok');
+  res.json({ ok: problemas.length === 0, fuente, items: resultado, problemas });
+});
+
 // --- Contador de visitas ---
 //
 // Se guarda AGREGADO POR DÍA, nunca visita por visita: `{ "2026-08-31": { vistas, sesiones,
@@ -3336,6 +3436,9 @@ const isChatRateLimited = makeRateLimiter(20, 60 * 60 * 1000); // 20 messages/ho
 // Generoso a propósito: una persona navegando 40 páginas en una hora es normal, y pasarse solo
 // significa que se dejan de contar sus páginas de más, no que se le bloquee el sitio.
 const isVisitRateLimited = makeRateLimiter(120, 60 * 60 * 1000);
+// La comprobación de carrito pega a PLADE. 30 por hora deja rehacer el checkout varias veces sin
+// convertir la tienda en una fuente de carga para el sistema del negocio.
+const isCartCheckRateLimited = makeRateLimiter(30, 60 * 60 * 1000);
 const isReviewRateLimited = makeRateLimiter(5, 60 * 60 * 1000); // 5 reviews/hour
 const isOrderRateLimited = makeRateLimiter(10, 60 * 60 * 1000); // 10 pedidos/hora/IP
 
