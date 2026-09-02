@@ -3521,6 +3521,37 @@ app.get('/api/categories', (req, res) => {
   res.json(categories);
 });
 
+// Cuántos productos puede comprar HOY un cliente. Lo consume el contador de la portada.
+//
+// Endpoint aparte y no un campo en /api/products a propósito: el catálogo pesa 2,4 MB y el
+// contador se refresca solo cada minuto en cada pestaña abierta. Mandar el catálogo entero para
+// mostrar un número sería descargar megabytes por un dato de cuatro cifras.
+//
+// "Disponible" es exactamente lo mismo que decide la banda azul/roja de la tienda: hace falta
+// stock de 1 unidad ENTERA o más y un precio de verdad. Los tres descartes tienen su razón:
+//   - stock null      -> PLADE no lleva la cuenta; se muestra "Disponible próximamente" (ver 2.32)
+//   - stock 0.8       -> no se puede vender una unidad, así que para el cliente no existe
+//   - precio 0        -> ficha a medio cargar; tampoco se vende
+// Si esta regla cambia, tiene que cambiar a la vez en tienda_web/lib/disponibilidad.ts.
+app.get('/api/stats/disponibles', (req, res) => {
+  const ajustes = loadStockAdjustments();
+  // soloCategoriasActivas: lo que está en una categoría pausada no se puede comprar, así que no
+  // cuenta. Sin esto, pausar una categoría dejaba el contador prometiendo mercancía invisible.
+  const productos = soloCategoriasActivas(loadProducts());
+  let disponibles = 0;
+  for (const p of productos) {
+    if (!p.price || Number(p.price) <= 0) continue;
+    // Contra el stock EFECTIVO —descontando pedidos que PLADE todavía no procesó— porque es el
+    // número que ve el comprador en la ficha. Si no, el contador diría una cosa y el producto otra.
+    const unidades = unidadesComprables(applyPendingStock(p.stock, p.id, ajustes));
+    if (unidades !== null && unidades >= 1) disponibles += 1;
+  }
+  // Medio minuto de caché: con varias pestañas abiertas refrescando, esto lo absorbe Cloudflare en
+  // vez de llegar acá. Para un contador de catálogo, medio minuto de retraso no se nota.
+  res.set('Cache-Control', 'public, max-age=30');
+  res.json({ disponibles, total: productos.length, actualizado: new Date().toISOString() });
+});
+
 // --- Simple in-memory rate limiter, per IP, reused for chat and review submissions ---
 function makeRateLimiter(limit, windowMs) {
   const byIp = new Map();
