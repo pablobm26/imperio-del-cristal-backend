@@ -2240,6 +2240,22 @@ function paisDeLaPeticion(req) {
   return pais;
 }
 
+/**
+ * Estado del visitante DENTRO de Venezuela. Vercel manda el código ISO 3166-2 sin el prefijo del
+ * país: para Venezuela son letras sueltas ("G" = Carabobo).
+ *
+ * Solo se guarda cuando el país es VE: el estado de un visitante de Colombia o España no le dice
+ * nada al dueño y multiplicaría las claves del archivo sin motivo.
+ */
+function regionDeLaPeticion(req, pais) {
+  if (pais !== 'VE') return null;
+  const crudo = String(req.headers['x-region'] || req.headers['x-vercel-ip-country-region'] || '').trim().toUpperCase();
+  // Se acepta tanto "G" como "VE-G", que es como lo mandan algunas redes.
+  const limpio = crudo.startsWith('VE-') ? crudo.slice(3) : crudo;
+  if (!/^[A-Z0-9]{1,3}$/.test(limpio)) return null;
+  return limpio;
+}
+
 // Los buscadores y los previsualizadores de enlaces (WhatsApp, Facebook) NO son visitas de
 // personas. Sin este filtro, el conteo sube solo y el dueño cree que tiene tráfico que no tiene.
 const ES_BOT = /bot|crawl|spider|slurp|bing|yandex|baidu|duckduck|facebookexternalhit|whatsapp|telegram|preview|headless|lighthouse|pingdom|uptime|curl|wget|python-requests|axios|node-fetch/i;
@@ -2338,10 +2354,14 @@ app.post('/api/visit', (req, res) => {
     dia.sistemas = dia.sistemas || {};
     dia.origenes = dia.origenes || {};
     dia.horas = dia.horas || {};
+    dia.estados = dia.estados || {};
 
     dia.vistas += 1;
     const pais = paisDeLaPeticion(req);
     dia.paises[pais] = (dia.paises[pais] || 0) + 1;
+
+    const estado = regionDeLaPeticion(req, pais);
+    if (estado) dia.estados[estado] = (dia.estados[estado] || 0) + 1;
 
     const aparato = dispositivoDe(ua);
     dia.dispositivos[aparato] = (dia.dispositivos[aparato] || 0) + 1;
@@ -2462,6 +2482,7 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
     for (const [h, n] of Object.entries(d.horas)) porHora.set(Number(h), (porHora.get(Number(h)) || 0) + n);
   }
   const horas = Array.from({ length: 24 }, (_, h) => ({ hora: h, vistas: porHora.get(h) || 0 }));
+  const estados = acumular('estados').map(({ clave, total }) => ({ codigo: clave, vistas: total }));
   const dispositivos = acumular('dispositivos');
   const sistemas = acumular('sistemas');
   const origenes = acumular('origenes');
@@ -2474,6 +2495,7 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
     dias,
     serie,
     paises,
+    estados,
     horas,
     dispositivos,
     sistemas,
