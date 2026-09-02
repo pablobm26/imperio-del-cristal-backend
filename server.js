@@ -2283,6 +2283,27 @@ function paisDeLaPeticion(req) {
  */
 const PAISES_CON_REGION = new Set(['VE', 'CO', 'US']);
 
+/**
+ * Une las claves viejas con las nuevas.
+ *
+ * La primera versión de esto guardaba el código PELADO ("G") y solo para Venezuela; la de ahora lo
+ * guarda con el país delante ("VE-G"). En el archivo conviven las dos formas, y sin normalizar el
+ * panel mostraba **dos filas con el mismo nombre**: "Carabobo" por las visitas viejas y "Carabobo"
+ * otra vez por las nuevas.
+ *
+ * Que una clave sin guion sea venezolana no es una suposición: en aquella versión la función
+ * devolvía `null` para cualquier país que no fuera VE (commit def2047), así que no pudo escribirse
+ * otra cosa.
+ *
+ * Se normaliza AL LEER y no reescribiendo el archivo a propósito: las visitas son el único registro
+ * histórico que hay y no se gana nada tocándolo. Lo que se escribe hoy ya va con prefijo, así que
+ * las claves peladas son un conjunto cerrado que no vuelve a crecer.
+ */
+function normalizaRegion(clave) {
+  const k = String(clave || '').trim().toUpperCase();
+  return k.includes('-') ? k : `VE-${k}`;
+}
+
 function regionDeLaPeticion(req, pais) {
   if (!PAISES_CON_REGION.has(pais)) return null;
   const crudo = String(req.headers['x-region'] || req.headers['x-vercel-ip-country-region'] || '')
@@ -2497,12 +2518,15 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
   }
 
   // Un solo recorrido para los cuatro desgloses.
-  const acumular = (campo) => {
+  const acumular = (campo, normaliza = (x) => x) => {
     const mapa = new Map();
     for (const { dia } of serie) {
       const d = visitas[dia];
       if (!d || !d[campo]) continue;
-      for (const [clave, n] of Object.entries(d[campo])) mapa.set(clave, (mapa.get(clave) || 0) + n);
+      for (const [clave, n] of Object.entries(d[campo])) {
+        const k = normaliza(clave);
+        mapa.set(k, (mapa.get(k) || 0) + n);
+      }
     }
     return [...mapa.entries()]
       .map(([clave, total]) => ({ clave, total }))
@@ -2520,7 +2544,7 @@ app.get('/api/admin/visits', requireAdminRole('admin'), (req, res) => {
     for (const [h, n] of Object.entries(d.horas)) porHora.set(Number(h), (porHora.get(Number(h)) || 0) + n);
   }
   const horas = Array.from({ length: 24 }, (_, h) => ({ hora: h, vistas: porHora.get(h) || 0 }));
-  const estados = acumular('estados').map(({ clave, total }) => ({ codigo: clave, vistas: total }));
+  const estados = acumular('estados', normalizaRegion).map(({ clave, total }) => ({ codigo: clave, vistas: total }));
   const dispositivos = acumular('dispositivos');
   const sistemas = acumular('sistemas');
   const origenes = acumular('origenes');
