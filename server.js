@@ -4584,6 +4584,17 @@ app.get('/api/health', (req, res) => res.json({
     impresion: Boolean(PRINT_AGENT_TOKEN),
     plade: isPladeConfigured(),
   },
+  // Cuántos aparatos tienen los avisos activados. Es un NÚMERO, no la lista: no dice de quién son
+  // ni permite alcanzarlos. Responde la pregunta que si no queda sin respuesta: "¿por qué no me
+  // llegó el aviso?" — si acá hay un cero, no le llegó a nadie porque no hay a quién mandarlo.
+  aparatosConAvisos: (() => {
+    try {
+      const s = pushSubsStore.load();
+      return Array.isArray(s) ? s.length : 0;
+    } catch {
+      return null;
+    }
+  })(),
 }));
 
 // ===========================================================================================
