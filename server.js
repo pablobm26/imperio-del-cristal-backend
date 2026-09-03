@@ -111,6 +111,10 @@ const VISITS_FILE = path.join(DATA_DIR, 'visits.json');
 // De qué sedes de PLADE se toma el inventario. Vive en el disco y no en una variable de entorno
 // porque el dueño lo cambia desde el panel: abrir una sede nueva no debería exigir un despliegue.
 const INVENTORY_CONFIG_FILE = path.join(DATA_DIR, 'inventory_config.json');
+// Aparatos con notificaciones activas. Es una lista de "direcciones de entrega" que dan los
+// servicios de push (Google, Apple, Mozilla): no son datos de la persona ni permiten identificar el
+// teléfono, solo entregarle un aviso.
+const PUSH_SUBS_FILE = path.join(DATA_DIR, 'push_subscriptions.json');
 const PRINT_QUEUE_FILE = path.join(DATA_DIR, 'print_queue.json');
 // Qué impresora usar y cómo. Lo edita el dueño desde el panel.
 const PRINT_CONFIG_FILE = path.join(DATA_DIR, 'print_config.json');
@@ -147,6 +151,7 @@ if (!fs.existsSync(VISITS_FILE)) fs.writeFileSync(VISITS_FILE, '{}');
 // esa combinación deja 4.356 productos a la venta, contra 4.755 de todas las sedes y 3.810 de solo
 // Av Bolívar. A partir de acá manda el panel — esto solo siembra el archivo la primera vez.
 if (!fs.existsSync(INVENTORY_CONFIG_FILE)) fs.writeFileSync(INVENTORY_CONFIG_FILE, JSON.stringify({ sucursales: [1, 5] }, null, 2));
+if (!fs.existsSync(PUSH_SUBS_FILE)) fs.writeFileSync(PUSH_SUBS_FILE, '[]');
 if (!fs.existsSync(PRINT_QUEUE_FILE)) fs.writeFileSync(PRINT_QUEUE_FILE, '[]');
 if (!fs.existsSync(PRINT_CONFIG_FILE)) fs.writeFileSync(PRINT_CONFIG_FILE, '{}');
 if (!fs.existsSync(ORDERS_PDF_DIR)) fs.mkdirSync(ORDERS_PDF_DIR, { recursive: true });
@@ -366,6 +371,7 @@ const reviewsStore = makeJsonStore(REVIEWS_FILE);
 const pausedCategoriesStore = makeJsonStore(PAUSED_CATEGORIES_FILE);
 const visitsStore = makeJsonStore(VISITS_FILE);
 const inventoryConfigStore = makeJsonStore(INVENTORY_CONFIG_FILE);
+const pushSubsStore = makeJsonStore(PUSH_SUBS_FILE);
 const printQueueStore = makeJsonStore(PRINT_QUEUE_FILE);
 const printConfigStore = makeJsonStore(PRINT_CONFIG_FILE);
 
@@ -4065,6 +4071,9 @@ app.post('/api/orders', (req, res) => {
   // registrada. `encolarImpresion` no lanza: si la impresión falla, la venta sigue en pie y el
   // recibo se puede sacar después desde el panel.
   encolarImpresion(orderId, 'pedido');
+  // Y el aviso al celular, por el mismo motivo y con la misma regla: nunca lanza, así que un fallo
+  // acá no puede tumbar una venta ya cobrada. Se le pasa el pedido recién guardado.
+  notificarCompra(orders[orders.length - 1]);
   // Se descuenta para todo pedido que se completa (invitado o no, cualquier método de pago) —
   // mismo momento en el que ya se crea la factura real en PLADE más abajo. Si el dueño anula el
   // pedido después, se repone en POST /admin/purchases/:id (solo pedidos con userId llegan ahí).
@@ -4678,6 +4687,207 @@ app.put('/api/admin/inventario/sedes/ocultas', requireAdminRole('admin'), requie
   inventoryConfigStore.save({ ...actual, ocultas: pedidas, actualizado: new Date().toISOString() });
   res.json({ ocultas: pedidas });
 });
+
+// ===========================================================================================
+// NOTIFICACIONES AL CELULAR (Web Push)
+// ===========================================================================================
+//
+// Cuando entra una compra, además de imprimirse el recibo en la tienda, le llega un aviso al
+// teléfono de quien tenga el panel instalado — **aunque la aplicación esté cerrada**. Eso es lo que
+// distingue una notificación de verdad de un mensaje dentro de la página: no hace falta tener el
+// panel abierto ni el navegador vivo.
+//
+// Cómo funciona, en corto: el navegador le pide a su propio servicio (Google, Apple, Mozilla) una
+// "dirección de entrega" para ese aparato. Esa dirección se guarda acá. Para avisar, se le manda el
+// mensaje a ese servicio firmado con la clave privada VAPID, y él lo entrega. **Nosotros nunca
+// hablamos directo con el teléfono**, ni sabemos cuál es.
+//
+// En iOS solo funciona si el panel está INSTALADO en la pantalla de inicio (iOS 16.4 o superior).
+// En Android y en escritorio funciona instalado o no.
+
+const webpush = require('web-push');
+
+const VAPID_PUBLIC = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
+// El "subject" es un correo de contacto que exige el estándar: si nuestros envíos dieran problemas,
+// es por donde el servicio de entrega avisaría.
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:zdcompanyoficial@gmail.com';
+
+const PUSH_CONFIGURADO = Boolean(VAPID_PUBLIC && VAPID_PRIVATE);
+if (PUSH_CONFIGURADO) {
+  webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC, VAPID_PRIVATE);
+} else {
+  console.log('Notificaciones desactivadas: faltan VAPID_PUBLIC_KEY y VAPID_PRIVATE_KEY.');
+}
+
+function loadPushSubs() {
+  const s = pushSubsStore.load();
+  return Array.isArray(s) ? s : [];
+}
+function savePushSubs(subs) {
+  pushSubsStore.save(subs);
+}
+
+/**
+ * La clave pública, para que el navegador pueda suscribirse. **No es secreta**: viaja al cliente
+ * por diseño. La privada no sale nunca de Render.
+ */
+app.get('/api/admin/push/clave', requireAdminRole('admin', 'salidas', 'empleado'), (req, res) => {
+  res.json({ configurado: PUSH_CONFIGURADO, clavePublica: PUSH_CONFIGURADO ? VAPID_PUBLIC : null });
+});
+
+/**
+ * Guarda la "dirección de entrega" de un aparato.
+ *
+ * Se guarda junto a QUIÉN se suscribió, y no como una lista anónima, por dos motivos: para poder
+ * mandarle a cada uno solo lo que le corresponde ver (el monto solo a quien tiene el permiso de
+ * cifras), y para poder borrar las suyas si esa cuenta se desactiva.
+ */
+app.post('/api/admin/push/suscribir', requireAdminRole('admin', 'salidas', 'empleado'), (req, res) => {
+  if (!PUSH_CONFIGURADO) return res.status(503).json({ error: 'Las notificaciones no están configuradas en el servidor.' });
+
+  const sub = req.body && req.body.suscripcion;
+  if (!sub || typeof sub.endpoint !== 'string' || !sub.keys || !sub.keys.p256dh || !sub.keys.auth) {
+    return res.status(400).json({ error: 'La suscripción no tiene la forma esperada.' });
+  }
+
+  const subs = loadPushSubs();
+  // El endpoint identifica al aparato. Si ya estaba, se actualiza en vez de duplicar: un mismo
+  // teléfono que vuelve a activar las notificaciones no debe recibir dos avisos por cada venta.
+  const i = subs.findIndex((s) => s.endpoint === sub.endpoint);
+  const registro = {
+    endpoint: sub.endpoint,
+    keys: { p256dh: String(sub.keys.p256dh), auth: String(sub.keys.auth) },
+    usuario: req.adminUser.username || req.adminRole,
+    sub: req.adminUser.sub || null,
+    rol: req.adminRole,
+    // Se guardan los permisos del momento de suscribirse solo como referencia; al enviar se
+    // vuelven a resolver contra la cuenta, que puede haber cambiado.
+    creado: i >= 0 ? subs[i].creado : new Date().toISOString(),
+    actualizado: new Date().toISOString(),
+    aparato: String((req.body && req.body.aparato) || '').slice(0, 80),
+  };
+  if (i >= 0) subs[i] = registro;
+  else subs.push(registro);
+  savePushSubs(subs);
+  console.log(`Notificaciones activadas para ${registro.usuario} (${subs.length} aparatos en total)`);
+  res.json({ ok: true, aparatos: subs.length });
+});
+
+app.post('/api/admin/push/desuscribir', requireAdminRole('admin', 'salidas', 'empleado'), (req, res) => {
+  const endpoint = req.body && req.body.endpoint;
+  if (!endpoint) return res.status(400).json({ error: 'Falta el endpoint.' });
+  const subs = loadPushSubs().filter((s) => s.endpoint !== endpoint);
+  savePushSubs(subs);
+  res.json({ ok: true, aparatos: subs.length });
+});
+
+/** Cuántos aparatos tiene esta cuenta con notificaciones activas. */
+app.get('/api/admin/push/estado', requireAdminRole('admin', 'salidas', 'empleado'), (req, res) => {
+  const mios = loadPushSubs().filter((s) => s.usuario === (req.adminUser.username || req.adminRole));
+  res.json({
+    configurado: PUSH_CONFIGURADO,
+    misAparatos: mios.map((s) => ({ aparato: s.aparato, desde: s.creado })),
+    totalAparatos: loadPushSubs().length,
+  });
+});
+
+app.post('/api/admin/push/prueba', requireAdminRole('admin', 'salidas', 'empleado'), async (req, res) => {
+  if (!PUSH_CONFIGURADO) return res.status(503).json({ error: 'Las notificaciones no están configuradas.' });
+  const yo = req.adminUser.username || req.adminRole;
+  const mios = loadPushSubs().filter((s) => s.usuario === yo);
+  if (mios.length === 0) return res.status(400).json({ error: 'Esta cuenta no tiene ningún aparato con notificaciones activas.' });
+
+  const enviados = await enviarATodos(mios, {
+    titulo: 'Prueba de notificación',
+    cuerpo: 'Si ves esto, las notificaciones funcionan.',
+    url: '/admin',
+    etiqueta: 'prueba',
+  });
+  res.json({ ok: true, enviados });
+});
+
+/**
+ * Manda un aviso a una lista de aparatos y limpia los que ya no existen.
+ *
+ * **Un 404 o un 410 significa que esa suscripción murió** —se desinstaló la aplicación, se borraron
+ * los datos del navegador, se cambió de teléfono— y hay que borrarla. Si no se limpiaran, la lista
+ * crecería para siempre con direcciones muertas y cada venta gastaría envíos contra la nada.
+ */
+async function enviarATodos(destinos, aviso) {
+  const carga = JSON.stringify(aviso);
+  const muertas = [];
+  let enviados = 0;
+
+  await Promise.all(
+    destinos.map(async (s) => {
+      try {
+        await webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys }, carga, { TTL: 3600 });
+        enviados += 1;
+      } catch (err) {
+        if (err && (err.statusCode === 404 || err.statusCode === 410)) muertas.push(s.endpoint);
+        else console.error(`Push falló para ${s.usuario}: ${err && err.message}`);
+      }
+    })
+  );
+
+  if (muertas.length > 0) {
+    savePushSubs(loadPushSubs().filter((s) => !muertas.includes(s.endpoint)));
+    console.log(`Se limpiaron ${muertas.length} suscripciones muertas.`);
+  }
+  return enviados;
+}
+
+/**
+ * Avisa de una compra nueva a todo el que tenga notificaciones activas y permiso para ver pedidos.
+ *
+ * **Nunca lanza.** Se llama desde la creación del pedido, y un fallo acá no puede tumbar una venta
+ * que el cliente ya pagó — igual que con la impresión.
+ *
+ * **El monto solo va a quien tiene el permiso de cifras** (`contador`). Una notificación se ve en la
+ * pantalla bloqueada, sin desbloquear el teléfono: si a un empleado no se le muestran los montos en
+ * el panel, no tiene sentido que se los muestre el aviso.
+ */
+function notificarCompra(pedido) {
+  if (!PUSH_CONFIGURADO) return;
+  try {
+    const subs = loadPushSubs();
+    if (subs.length === 0) return;
+
+    const conMonto = [];
+    const sinMonto = [];
+    for (const s of subs) {
+      const cuenta = { role: s.rol, permissions: null };
+      if (!tienePermiso(cuenta, 'pedidos')) continue;
+      (tienePermiso(cuenta, 'contador') ? conMonto : sinMonto).push(s);
+    }
+
+    const donde = [pedido.ciudad, pedido.estado].filter(Boolean).join(', ');
+    const base = {
+      url: `/admin/pedidos?buscar=${encodeURIComponent(pedido.orderId)}`,
+      // La etiqueta agrupa: si entran tres ventas seguidas, no quedan tres avisos apilados sino el
+      // último. Con `renotify` el teléfono vuelve a sonar igual.
+      etiqueta: 'compra',
+    };
+
+    if (conMonto.length > 0) {
+      enviarATodos(conMonto, {
+        ...base,
+        titulo: `Nueva compra · $${(Number(pedido.total) || 0).toFixed(2)}`,
+        cuerpo: `${pedido.nombre || 'Cliente'}${donde ? ` — ${donde}` : ''}\nPedido ${pedido.orderId}`,
+      }).catch((err) => console.error('No se pudo notificar la compra:', err.message));
+    }
+    if (sinMonto.length > 0) {
+      enviarATodos(sinMonto, {
+        ...base,
+        titulo: 'Nueva compra',
+        cuerpo: `Pedido ${pedido.orderId}${donde ? ` — ${donde}` : ''}`,
+      }).catch((err) => console.error('No se pudo notificar la compra:', err.message));
+    }
+  } catch (err) {
+    console.error('No se pudo notificar la compra:', err.message);
+  }
+}
 
 // ===========================================================================================
 // IMPRESIÓN EN LA TIENDA — cola + canal para el agente
