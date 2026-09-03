@@ -4577,6 +4577,13 @@ app.get('/api/health', (req, res) => res.json({
   // Qué columnas opcionales ve la base. Sirve para saber si una migración se corrió sin tener que
   // entrar al panel. Son nombres de columna, no datos de nadie.
   esquema: COLUMNAS_EN_BASE,
+  // Qué piezas opcionales están configuradas. Son BOOLEANOS, nunca los valores: sirve para
+  // responder "¿ya puse esa variable en Render?" sin credenciales y sin exponer ningún secreto.
+  configurado: {
+    push: PUSH_CONFIGURADO,
+    impresion: Boolean(PRINT_AGENT_TOKEN),
+    plade: isPladeConfigured(),
+  },
 }));
 
 // ===========================================================================================
