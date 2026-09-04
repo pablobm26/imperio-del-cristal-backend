@@ -2965,6 +2965,73 @@ app.patch('/api/admin/products/:id/details', requireAdminRole('admin'), (req, re
   res.json({ product: merged });
 });
 
+/**
+ * Carga masiva de fichas por TOKEN, hermana de `/admin/details-upload` pero sin la contraseña.
+ *
+ * El importador de planilla exige `ADMIN_PASSWORD` en cada envío, así que solo lo puede usar quien
+ * la escriba a mano. Este hace lo mismo con la sesión del panel, que es la que ya tiene el dueño
+ * abierta — pensado para rescates puntuales como las fotos 2-4 que PLADE guarda en `img_1..img_3`
+ * y que `getInventario` no devuelve.
+ *
+ * **Una sola escritura para todo el lote, no una por producto.** Con 357 fichas, guardar en cada
+ * vuelta dejaría 357 ventanas con el archivo a medio actualizar mientras la tienda lo está leyendo,
+ * y 357 oportunidades de cortarse por la mitad. Se arma todo en memoria y se graba una vez.
+ *
+ * **Un campo vacío NO borra**, igual que en la planilla: este endpoint agrega o pisa, nunca limpia.
+ * Para borrar está el PATCH de arriba, producto por producto, que es donde ese gesto es deliberado.
+ */
+app.post('/api/admin/details/bulk', requireAdminRole('admin'), (req, res) => {
+  const items = Array.isArray(req.body?.items) ? req.body.items : null;
+  if (!items) return res.status(400).json({ error: 'Falta `items`: se espera un arreglo.' });
+  if (items.length === 0) return res.status(400).json({ error: 'El arreglo `items` vino vacío.' });
+  if (items.length > 5000) return res.status(413).json({ error: 'Máximo 5000 fichas por lote.' });
+
+  const conocidos = new Set(loadProducts().map((p) => p.id));
+  const details = loadDetails();
+
+  let actualizados = 0;
+  let camposEscritos = 0;
+  const desconocidos = [];
+
+  for (const item of items) {
+    const id = String(item?.id ?? '').trim();
+    if (!id) continue;
+    // Un detalle huérfano no se puede mostrar en la tienda: se reporta en vez de guardarlo.
+    if (!conocidos.has(id)) {
+      if (desconocidos.length < 25) desconocidos.push(id);
+      continue;
+    }
+
+    const entry = { ...(details[id] || {}) };
+    let tocado = false;
+
+    for (const field of DETAIL_TEXT_FIELDS) {
+      const value = String(item[field] ?? '').trim();
+      if (!value) continue;
+      if (entry[field] === value) continue;
+      entry[field] = value;
+      tocado = true;
+      camposEscritos++;
+    }
+    for (const field of DETAIL_NUMBER_FIELDS) {
+      if (item[field] === undefined || item[field] === null || item[field] === '') continue;
+      const value = parseOptionalNumber(item[field]);
+      if (value === null || entry[field] === value) continue;
+      entry[field] = value;
+      tocado = true;
+      camposEscritos++;
+    }
+
+    if (!tocado) continue;
+    details[id] = entry;
+    actualizados++;
+  }
+
+  if (actualizados > 0) saveDetails(details);
+  console.log(`Carga masiva de fichas: ${actualizados} productos, ${camposEscritos} campos escritos.`);
+  res.json({ recibidos: items.length, actualizados, camposEscritos, desconocidos });
+});
+
 app.post('/api/admin/products/:id/images', requireAdminRole('admin'), upload.single('file'), async (req, res) => {
   if (!productImages.isImagesConfigured()) {
     return res.status(503).json({ error: 'Supabase no está configurado: no se pueden guardar fotos.' });
