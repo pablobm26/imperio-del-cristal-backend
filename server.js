@@ -4677,7 +4677,18 @@ app.get('/api/health', (req, res) => res.json({
 // abre y cierra sedes, y eso no debería exigir un despliegue.
 
 /** Las sedes del negocio, para que el panel las muestre por nombre y no como números sueltos. */
-const SUCURSALES_CONOCIDAS = [
+/**
+ * Los nombres y direcciones de las sedes, tal como los conocemos al escribir el código.
+ *
+ * **Son solo el valor por defecto.** La API de PLADE no devuelve el nombre de un almacén por ningún
+ * lado —su manual documenta exactamente tres operaciones (`getInventario`, `getFactura`,
+ * `savePedidoExterno`) y ninguna trae sedes—, así que esta lista no se puede sincronizar sola. Lo
+ * que el panel muestra sale de `sucursalesConocidas()`, que pisa estos valores con lo que el dueño
+ * haya editado; así renombrar una sede en PLADE no obliga a tocar el código ni a desplegar.
+ *
+ * Los IDs sí son de PLADE y **no se editan**: son la clave con la que se le pide el inventario.
+ */
+const SUCURSALES_POR_DEFECTO = [
   { id: 11, nombre: 'SEDE NUEVA 2026', direccion: 'Casa Prebo (con piscina)', tipo: 'ALMACÉN' },
   { id: 10, nombre: 'CASA PABLO', direccion: 'Casa Naguanagua (próximamente)', tipo: 'ALMACÉN' },
   { id: 9, nombre: 'ONLINE', direccion: 'Casa El Trigal', tipo: 'SUCURSAL' },
@@ -4689,11 +4700,48 @@ const SUCURSALES_CONOCIDAS = [
   { id: 1, nombre: 'DEPÓSITO GENERAL', direccion: 'Almacén principal', tipo: 'SUCURSAL' },
 ];
 
+/** Cuánto puede medir un nombre o una dirección de sede. Suficiente para el nombre más largo que
+ *  usan hoy y corto para que no rompa la fila del panel. */
+const LARGO_MAX_SEDE = 60;
+
+function textoDeSede(valor, porDefecto) {
+  const s = String(valor ?? '').trim().replace(/\s+/g, ' ');
+  if (!s) return porDefecto;
+  return s.slice(0, LARGO_MAX_SEDE);
+}
+
+/**
+ * La lista que ve el panel: los valores por defecto, pisados por lo que el dueño haya editado.
+ *
+ * Un nombre editado a cadena vacía **vuelve al valor por defecto** en vez de dejar una fila sin
+ * título: una sede sin nombre en la pantalla de inventario no se puede identificar, y el ID solo no
+ * le dice nada a nadie.
+ */
+function sucursalesConocidas() {
+  let editados = {};
+  try {
+    const c = inventoryConfigStore.load();
+    if (c && c.nombres && typeof c.nombres === 'object') editados = c.nombres;
+  } catch {
+    // Config ilegible: se muestran los valores por defecto, que es lo peor que puede pasar acá.
+  }
+  return SUCURSALES_POR_DEFECTO.map((s) => {
+    const e = editados[String(s.id)];
+    if (!e) return s;
+    return {
+      ...s,
+      nombre: textoDeSede(e.nombre, s.nombre),
+      direccion: textoDeSede(e.direccion, s.direccion),
+      editada: true,
+    };
+  });
+}
+
 app.get('/api/admin/inventario/sedes', requireAdminRole('admin'), requierePermiso('sedes'), (req, res) => {
   res.json({
     seleccionadas: sucursalesDeInventario(),
     ocultas: sucursalesOcultas(),
-    conocidas: SUCURSALES_CONOCIDAS,
+    conocidas: sucursalesConocidas(),
     pladeConectado: isPladeConfigured(),
     ultimaSync: lastPladeSync,
   });
@@ -4733,7 +4781,10 @@ app.put('/api/admin/inventario/sedes', requireAdminRole('admin'), requierePermis
   // sede, sin error— queda descartado acá y no llega nunca al archivo.
   // Una sede que pasa a estar EN USO deja de estar oculta: no puede aportar stock desde la sombra.
   const ocultas = sucursalesOcultas().filter((id) => !ids.includes(id));
-  inventoryConfigStore.save({ sucursales: ids, ocultas, actualizado: new Date().toISOString() });
+  // Se conserva el resto del archivo (los nombres editados viven acá también): guardar un objeto
+  // nuevo con solo estas tres claves los borraría en silencio al cambiar de sede.
+  const actual = inventoryConfigStore.load() || {};
+  inventoryConfigStore.save({ ...actual, sucursales: ids, ocultas, actualizado: new Date().toISOString() });
   console.log(`Sedes de inventario: ${ids.length === 0 ? 'todas' : ids.join(' + ')}`);
 
   // Se resincroniza en el acto: sin esto el catálogo seguiría mostrando el stock viejo hasta ocho
@@ -4771,6 +4822,49 @@ app.put('/api/admin/inventario/sedes/ocultas', requireAdminRole('admin'), requie
   const actual = inventoryConfigStore.load() || {};
   inventoryConfigStore.save({ ...actual, ocultas: pedidas, actualizado: new Date().toISOString() });
   res.json({ ocultas: pedidas });
+});
+
+/**
+ * Renombrar una sede en el panel.
+ *
+ * PLADE no expone los nombres de sus almacenes por API, así que cuando los renombran allá no hay
+ * forma de enterarse: hay que copiarlos a mano. Este endpoint existe para que eso sea una edición
+ * de diez segundos en la pantalla de Sedes y no un cambio de código con despliegue.
+ *
+ * **El ID no se toca.** Es la clave con la que se le pide el inventario a PLADE; renombrar es
+ * cosmético, cambiar un ID sería apuntar a otro almacén. Por eso solo se aceptan IDs que ya estén
+ * en la lista por defecto.
+ *
+ * No dispara resincronización: cambiar una etiqueta no cambia el stock.
+ */
+app.put('/api/admin/inventario/sedes/nombres', requireAdminRole('admin'), requierePermiso('sedes'), (req, res) => {
+  const pedidos = (req.body && req.body.nombres) || {};
+  if (typeof pedidos !== 'object' || Array.isArray(pedidos)) {
+    return res.status(400).json({ error: 'Se espera `nombres` como objeto { id: { nombre, direccion } }.' });
+  }
+
+  const validos = new Set(SUCURSALES_POR_DEFECTO.map((s) => String(s.id)));
+  const desconocidos = Object.keys(pedidos).filter((id) => !validos.has(String(id)));
+  if (desconocidos.length > 0) {
+    return res.status(400).json({ error: `Sedes que no existen: ${desconocidos.join(', ')}.` });
+  }
+
+  const guardar = {};
+  for (const s of SUCURSALES_POR_DEFECTO) {
+    const e = pedidos[String(s.id)];
+    if (!e) continue;
+    const nombre = textoDeSede(e.nombre, s.nombre);
+    const direccion = textoDeSede(e.direccion, s.direccion);
+    // Lo que coincide con el valor por defecto no se guarda: así el archivo solo contiene los
+    // cambios reales y una sede que vuelve a su nombre original deja de estar marcada como editada.
+    if (nombre === s.nombre && direccion === s.direccion) continue;
+    guardar[String(s.id)] = { nombre, direccion };
+  }
+
+  const actual = inventoryConfigStore.load() || {};
+  inventoryConfigStore.save({ ...actual, nombres: guardar, actualizado: new Date().toISOString() });
+  console.log(`Nombres de sedes: ${Object.keys(guardar).length} editados.`);
+  res.json({ conocidas: sucursalesConocidas(), editadas: Object.keys(guardar).length });
 });
 
 // ===========================================================================================
