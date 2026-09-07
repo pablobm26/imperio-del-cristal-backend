@@ -1824,6 +1824,50 @@ function resumirNiveles(clientes) {
   });
 }
 
+/** A cuánto de su próximo nivel se considera que a un cliente "le falta poco". */
+const CERCA_DE_SUBIR_USD = 50;
+/** Sin comprar en este tiempo, un cliente con nivel se considera dormido. */
+const DIAS_PARA_DORMIDO = 90;
+
+/**
+ * El resumen de arriba de la pantalla "Niveles de clientes".
+ *
+ * Se calcula acá, sobre la lista que la consulta YA trajo: no cuesta ni un viaje más a la base.
+ *
+ * Los dos últimos números son los únicos accionables de la pantalla, y por eso están: uno dice a
+ * quién conviene empujar con poco (le falta menos de ${CERCA_DE_SUBIR_USD} dólares para subir de
+ * nivel) y el otro a quién se está perdiendo (tiene descuento ganado y hace tres meses que no
+ * aparece). El resto de la pantalla dice cómo está repartida la clientela; esto dice qué hacer.
+ */
+function resumenGeneral(clientes) {
+  const ahora = Date.now();
+  const dias = (fecha) => (fecha ? (ahora - Date.parse(fecha)) / 86400000 : Infinity);
+
+  const compradores = clientes.filter((c) => c.orders12mo > 0);
+  const gasto12mo = compradores.reduce((s, c) => s + c.spend12mo, 0);
+  const compras12mo = compradores.reduce((s, c) => s + c.orders12mo, 0);
+  const redondear = (n) => Math.round(n * 100) / 100;
+
+  return {
+    clientes: clientes.length,
+    compradores: compradores.length,
+    nuevos30dias: clientes.filter((c) => dias(c.registeredAt) <= 30).length,
+    gasto12mo: redondear(gasto12mo),
+    compras12mo,
+    // Promedios sobre 0 dan NaN y llegarían al panel como null: se devuelve 0, que es lo que
+    // significa "todavía no hay nada que promediar".
+    ticketPromedio: compras12mo > 0 ? redondear(gasto12mo / compras12mo) : 0,
+    gastoPorComprador: compradores.length > 0 ? redondear(gasto12mo / compradores.length) : 0,
+    conDescuento: clientes.filter((c) => c.discountPercent > 0).length,
+    cercaDeSubir: clientes.filter(
+      (c) => c.orders12mo > 0 && c.amountToNext !== null && c.amountToNext <= CERCA_DE_SUBIR_USD
+    ).length,
+    dormidos: clientes.filter((c) => c.discountPercent > 0 && dias(c.lastPurchaseAt) > DIAS_PARA_DORMIDO).length,
+    umbralCerca: CERCA_DE_SUBIR_USD,
+    diasDormido: DIAS_PARA_DORMIDO,
+  };
+}
+
 function rechazarSinPermisoDeNiveles(req, res) {
   if (puedeVerContador(req)) return false;
   res.status(403).json({ error: 'Tu cuenta no tiene autorizado ver los niveles de clientes.' });
@@ -1833,18 +1877,19 @@ function rechazarSinPermisoDeNiveles(req, res) {
 app.get('/api/admin/loyalty/levels', requireAdminRole('master', 'admin'), async (req, res) => {
   if (rechazarSinPermisoDeNiveles(req, res)) return;
   if (!isLoyaltyConfigured()) {
-    return res.json({ configurado: false, migracionPendiente: false, niveles: [], totalClientes: 0 });
+    return res.json({ configurado: false, migracionPendiente: false, niveles: [], totalClientes: 0, resumen: null });
   }
   try {
     const clientes = await listLoyaltyLevels();
     if (clientes === null) {
-      return res.json({ configurado: true, migracionPendiente: true, niveles: [], totalClientes: 0 });
+      return res.json({ configurado: true, migracionPendiente: true, niveles: [], totalClientes: 0, resumen: null });
     }
     res.json({
       configurado: true,
       migracionPendiente: false,
       niveles: resumirNiveles(clientes),
       totalClientes: clientes.length,
+      resumen: resumenGeneral(clientes),
     });
   } catch (err) {
     console.error('No se pudieron cargar los niveles de fidelidad:', err.message);
@@ -1941,15 +1986,50 @@ app.get('/api/admin/dashboard', requireAdminRole('admin', 'empleado'), (req, res
     .sort((a, b) => b.unidades - a.unidades)
     .slice(0, 8);
 
-  const pocoStock = products
+  // ===========================================================================================
+  // EL RESUMEN HABLA DE LO QUE ESTÁ VIVO EN LA TIENDA, NO DEL ARCHIVO COMPLETO
+  // ===========================================================================================
+  //
+  // Antes todos estos números se calculaban sobre `products` entero, y por eso no coincidían con
+  // nada de lo que se ve: el catálogo trae más de 8.700 fichas, pero la tienda ofrece unas 4.300.
+  // La diferencia son las categorías pausadas y lo que está sin existencia. Decir "8.791
+  // productos" y "1.100 sin foto" mezclaba mercancía publicada con mercancía que nadie puede ver,
+  // así que ni el tamaño ni los pendientes servían para decidir nada.
+  //
+  // Ahora la base es la misma que usa el contador de la tienda (`/api/stats/disponibles`):
+  // `soloCategoriasActivas`, y el stock que ya viene descontado de pedidos sin procesar.
+  const visibles = soloCategoriasActivas(products);
+  const pausados = products.length - visibles.length;
+
+  /** A la venta de verdad: con precio y con al menos una unidad entera comprable. */
+  const enVenta = visibles.filter((p) => {
+    if (!p.price || Number(p.price) <= 0) return false;
+    const unidades = unidadesComprables(p.stock);
+    return unidades !== null && unidades >= 1;
+  });
+
+  // Solo de lo que está a la venta: avisar de que quedan 2 unidades de algo que nadie puede
+  // comprar —categoría pausada o sin precio— es ruido que tapa los avisos que sí importan.
+  const pocoStock = enVenta
     .filter((p) => typeof p.stock === 'number' && p.stock > 0 && p.stock < LOW_STOCK_THRESHOLD)
     .sort((a, b) => a.stock - b.stock);
 
   const catalogo = {
+    // Lo que el cliente puede comprar ahora mismo. Es el número que corresponde con el contador
+    // que ve en la portada.
+    enVenta: enVenta.length,
+    // Publicado: está en una categoría activa, aunque esté agotado (su ficha existe y Google la ve).
+    visibles: visibles.length,
     total: products.length,
-    sinFoto: products.filter((p) => !p.image).length,
-    sinDescripcion: products.filter((p) => !p.description || !String(p.description).trim()).length,
-    agotados: products.filter((p) => p.stock === 0).length,
+    pausados,
+    agotados: visibles.filter((p) => unidadesComprables(p.stock) === 0).length,
+    // Los pendientes se cuentan sobre lo VISIBLE: una ficha de una categoría pausada no tiene
+    // página, así que no le falta la foto para Google — todavía no existe para nadie.
+    sinFoto: visibles.filter((p) => !p.image).length,
+    // No se cuenta "sin descripción": daría 8.791 de 8.791 siempre. `getInventario` no devuelve
+    // texto largo (el campo `descripcion` de PLADE es el NOMBRE del producto), así que sin cargarlas
+    // a mano una por una ese número no se mueve nunca. Un dato que no cambia no es información.
+    sinPrecio: visibles.filter((p) => !p.price || Number(p.price) <= 0).length,
   };
 
   const payload = {
