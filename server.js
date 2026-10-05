@@ -452,8 +452,23 @@ const COURIER_LABELS = {
   fedexInternational: 'FedEx International',
   upsWorldwide: 'UPS Worldwide',
 };
-// Espejo de tienda_web/lib/delivery-zones.ts — solo aplica cuando paymentMethod es "cash".
+// Espejo de tienda_web/lib/delivery-zones.ts. Solo los nombres: la tarifa viaja en el pedido
+// (`deliveryFee`) y el backend no la valida contra una tabla.
 const DELIVERY_ZONE_LABELS = {
+  avBolivar: 'Av. Bolívar',
+  trigalNorte: 'Trigal Norte',
+  aguaBlanca: 'Agua Blanca',
+  elParral: 'El Parral',
+  lasQuintas: 'Las Quintas',
+  laCidraY190: 'La Cidra y 190',
+  rioSil: 'Río Sil',
+  trigalSur: 'Trigal Sur',
+  prebo: 'Prebo',
+  guayabitos: 'Guayabitos',
+  manongo: 'Mañongo',
+  campina: 'Campiña',
+  // Zonas anteriores: ya no se ofrecen, pero los pedidos viejos guardan estas claves y así siguen
+  // mostrando un nombre legible en vez de la clave cruda.
   valencia: 'Valencia',
   naguanagua: 'Naguanagua',
   sanDiego: 'San Diego',
