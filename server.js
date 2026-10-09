@@ -10,7 +10,7 @@ const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { construirRecibo, previsualizarRecibo } = require('./escpos-recibo');
-const { porcentajeDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento } = require('./descuento-online');
+const { porcentajeDescuentoOnline, minimoDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento } = require('./descuento-online');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade, normalizarSucursales } = require('./plade-marketplade-client');
 const adminUsers = require('./admin-users');
 const { FUNCIONES, permisosEfectivos, tienePermiso, normalizarPermisos } = require('./permisos');
@@ -1917,6 +1917,7 @@ function resumenDescuentoOnline() {
   const redondear = (n) => Math.round(n * 100) / 100;
   return {
     percent: porcentajeDescuentoOnline(),
+    minimo: minimoDescuentoOnline(),
     pedidos: conDescuento.length,
     descontado: redondear(conDescuento.reduce((s, o) => s + (Number(o.discountApplied.amount) || 0), 0)),
     vendido: redondear(conDescuento.reduce((s, o) => s + (Number(o.total) || 0), 0)),
@@ -4687,7 +4688,7 @@ app.post('/api/chat', async (req, res) => {
 // checkout). Público y sin datos de nadie. El que se cobra se recalcula al crear el pedido.
 app.get('/api/descuento-online', (req, res) => {
   res.set('Cache-Control', 'public, max-age=300');
-  res.json({ percent: porcentajeDescuentoOnline() });
+  res.json({ percent: porcentajeDescuentoOnline(), minimo: minimoDescuentoOnline() });
 });
 
 app.get('/api/bcv', (req, res) => {

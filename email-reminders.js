@@ -6,7 +6,7 @@
 // de romperse.
 
 const { createClient } = require('@supabase/supabase-js');
-const { porcentajeDescuentoOnline } = require('./descuento-online');
+const { porcentajeDescuentoOnline, minimoDescuentoOnline } = require('./descuento-online');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -46,6 +46,7 @@ const NEGRO = '#0a0a0a';
 function renderReminderEmail(items) {
   const total = items.reduce((suma, item) => suma + Number(item.price) * Number(item.quantity), 0);
   const pct = porcentajeDescuentoOnline();
+  const minimo = minimoDescuentoOnline();
 
   const filas = items
     .map(
@@ -94,7 +95,7 @@ function renderReminderEmail(items) {
               Apartaste estos productos y no llegaste a completar el pedido. Todavía te esperan.
             </p>
             ${pct > 0 ? `<p style="margin:12px 0 0;padding:10px 12px;background:#f6efd9;border-radius:6px;font-size:14px;line-height:1.5;color:${NEGRO};font-family:system-ui,-apple-system,'Segoe UI',sans-serif;">
-              Recuerda: comprando online tienes <strong>${pct}% de descuento</strong>, aplicado en el checkout antes de pagar.
+              Recuerda: comprando online tienes <strong>${pct}% de descuento</strong> en compras desde $${minimo}, aplicado en el checkout antes de pagar.
             </p>` : ''}
           </td>
         </tr>
@@ -157,6 +158,7 @@ function renderReminderEmail(items) {
 function renderReminderText(items) {
   const total = items.reduce((suma, item) => suma + Number(item.price) * Number(item.quantity), 0);
   const pct = porcentajeDescuentoOnline();
+  const minimo = minimoDescuentoOnline();
   const lineas = items
     .map((item) => `- ${item.quantity} x ${item.title}: $${(Number(item.price) * Number(item.quantity)).toFixed(2)}`)
     .join('\n');
@@ -168,7 +170,7 @@ Apartaste estos productos y no llegaste a completar el pedido:
 ${lineas}
 
 Total: $${total.toFixed(2)}
-${pct > 0 ? `\nRecuerda: comprando online tienes ${pct}% de descuento, aplicado en el checkout antes de pagar.\n` : ''}
+${pct > 0 ? `\nRecuerda: comprando online tienes ${pct}% de descuento en compras desde $${minimo}, aplicado en el checkout antes de pagar.\n` : ''}
 Ver mi carrito: ${STORE_URL}/carrito
 
 Los precios y la disponibilidad pueden cambiar: confirmamos todo al momento de tu compra.

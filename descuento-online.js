@@ -17,6 +17,11 @@
 // **Se suma a cualquier otra promoción:** se aplica sobre el precio vigente del catálogo, así que si
 // un producto ya viene rebajado desde PLADE, el 10% va encima de ese precio rebajado. El delivery
 // nunca se descuenta.
+//
+// **Compra mínima (regla del dueño, 2026-10-09):** el descuento solo aplica si el subtotal de
+// mercancía —precio de catálogo, ANTES del descuento y SIN delivery— es igual o mayor a
+// DESCUENTO_ONLINE_MINIMO (variable en Render; sin ella, $30). Por debajo, el pedido sale a precio
+// completo. La tienda usa el mismo umbral, que lee de GET /api/descuento-online.
 
 const round2 = (n) => Math.round(n * 100) / 100;
 
@@ -32,6 +37,17 @@ function porcentajeDescuentoOnline() {
   return n;
 }
 
+function minimoDescuentoOnline() {
+  const crudo = process.env.DESCUENTO_ONLINE_MINIMO;
+  const n = crudo === undefined || crudo === '' ? 30 : Number(crudo);
+  // Mal escrito: se mantiene el mínimo de siempre en vez de regalar el descuento a todo pedido.
+  if (!Number.isFinite(n) || n < 0) {
+    console.error(`DESCUENTO_ONLINE_MINIMO inválido (${crudo}); se usa $30.`);
+    return 30;
+  }
+  return n;
+}
+
 const ETIQUETA = 'Descuento compra online';
 
 /**
@@ -40,8 +56,9 @@ const ETIQUETA = 'Descuento compra online';
  * (descuento total de esa línea), más el resumen `discountApplied` (null si el porcentaje es 0).
  * `price` se conserva como el precio de lista, que es lo que el recibo muestra tachado.
  */
-function aplicarDescuentoOnline(items, percent = porcentajeDescuentoOnline()) {
-  if (!percent) {
+function aplicarDescuentoOnline(items, percent = porcentajeDescuentoOnline(), minimo = minimoDescuentoOnline()) {
+  const subtotal = round2(items.reduce((s, i) => s + i.price * i.quantity, 0));
+  if (!percent || subtotal < minimo) {
     return { items, discountApplied: null };
   }
   const conDescuento = items.map((item) => {
@@ -64,4 +81,4 @@ function etiquetaDescuento(discountApplied) {
   return `${nombre} (-${discountApplied.percent}%)`;
 }
 
-module.exports = { porcentajeDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento, ETIQUETA_DESCUENTO_ONLINE: ETIQUETA };
+module.exports = { porcentajeDescuentoOnline, minimoDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento, ETIQUETA_DESCUENTO_ONLINE: ETIQUETA };
