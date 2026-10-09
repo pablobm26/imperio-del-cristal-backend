@@ -189,6 +189,10 @@ function componer(pedido, ancho) {
     texto(`${item.title || item.id || ''}`);
     const detalle = `${cantidad} x ${dinero(item.price)}`;
     texto(aDosColumnas(`  ${item.id ? `[${item.id}] ` : ''}${detalle}`, dinero(cantidad * (Number(item.price) || 0)), ancho), { crudo: true });
+    // Descuento de compra online por artículo (pedidos desde 2026-10-08; los viejos no lo traen).
+    if (Number(item.onlineDiscount) > 0 && pedido.discountApplied) {
+      texto(aDosColumnas(`  Desc. online -${pedido.discountApplied.percent}%`, `-${dinero(item.onlineDiscount)}`, ancho), { crudo: true });
+    }
   }
   separador();
 
@@ -196,8 +200,12 @@ function componer(pedido, ancho) {
   const subtotal = (pedido.items || []).reduce((s, i) => s + (Number(i.price) || 0) * (Number(i.quantity) || 0), 0);
   texto(aDosColumnas(`Subtotal (${unidades} pza${unidades === 1 ? '' : 's'})`, dinero(subtotal), ancho), { crudo: true });
   if (pedido.deliveryFee) texto(aDosColumnas('Envio', dinero(pedido.deliveryFee), ancho), { crudo: true });
-  if (pedido.discountApplied) {
-    texto(aDosColumnas(`Descuento ${pedido.discountApplied}%`, `-${dinero(subtotal * (Number(pedido.discountApplied) / 100))}`, ancho), { crudo: true });
+  // `discountApplied` es un objeto { label?, tier, percent, amount } — antes se lo trataba como un
+  // número y salía "Descuento [object Object]%". Pedidos de niveles viejos no traen `label`.
+  if (pedido.discountApplied && Number(pedido.discountApplied.amount) > 0) {
+    const d = pedido.discountApplied;
+    const nombre = d.label ? 'Desc. compra online' : `Descuento ${d.tier || ''}`.trim();
+    texto(aDosColumnas(`${nombre} -${d.percent}%`, `-${dinero(d.amount)}`, ancho), { crudo: true });
   }
   separador('=');
   texto(aDosColumnas('TOTAL', dinero(pedido.total), ancho), { crudo: true, negrita: true });

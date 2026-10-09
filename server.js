@@ -10,6 +10,7 @@ const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { construirRecibo, previsualizarRecibo } = require('./escpos-recibo');
+const { porcentajeDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento } = require('./descuento-online');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade, normalizarSucursales } = require('./plade-marketplade-client');
 const adminUsers = require('./admin-users');
 const { FUNCIONES, permisosEfectivos, tienePermiso, normalizarPermisos } = require('./permisos');
@@ -587,6 +588,12 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
     doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(item.title);
     doc.font('Helvetica-Bold').fontSize(8);
     doc.text(`${item.quantity} x ${formatUsd(item.price)} = ${formatUsd(item.price * item.quantity)}`);
+    // Descuento de compra online POR PRODUCTO (decisión del dueño 2026-10-08: que el cliente vea en
+    // el recibo cuánto ahorró en cada artículo). Los pedidos viejos no traen `onlineDiscount`.
+    if (item.onlineDiscount > 0 && order.discountApplied) {
+      doc.text(`Desc. online -${order.discountApplied.percent}%: -${formatUsd(item.onlineDiscount)}`);
+      doc.text(`Pagas: ${item.quantity} x ${formatUsd(item.onlinePrice)} = ${formatUsd(item.onlinePrice * item.quantity)}`);
+    }
     doc.moveDown(0.3);
   }
   drawReceiptDivider(doc);
@@ -594,10 +601,10 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   if (order.discountApplied) {
     const subtotal = order.total + order.discountApplied.amount - (order.deliveryFee || 0);
     doc.font('Helvetica-Bold').fontSize(8).fillColor('#000').text(`Subtotal: ${formatUsd(subtotal)}`, { align: 'right' });
-    doc.text(
-      `Descuento nivel ${order.discountApplied.tier} (-${order.discountApplied.percent}%): -${formatUsd(order.discountApplied.amount)}`,
-      { align: 'right' }
-    );
+    doc.text(`${etiquetaDescuento(order.discountApplied)}: -${formatUsd(order.discountApplied.amount)}`, { align: 'right' });
+    if (order.deliveryFee) doc.text(`Delivery: +${formatUsd(order.deliveryFee)}`, { align: 'right' });
+    doc.moveDown(0.2);
+    doc.text(`Ahorraste ${formatUsd(order.discountApplied.amount)} comprando online`, { align: 'right' });
     doc.moveDown(0.2);
   }
 
@@ -936,7 +943,17 @@ async function submitOrderToPlade({ orderId, nota, items, country }) {
   const pladeItems = items.map((item) => {
     const product = catalogById.get(item.id);
     if (!product?.idPlade) return null;
-    return { idPlade: product.idPlade, title: item.title, quantity: item.quantity, price: item.price, ivaRate: product.ivaRate || 0 };
+    // Precio unitario YA con el descuento de compra online (decisión del dueño 2026-10-08): la
+    // factura de PLADE tiene que sumar lo mismo que se cobró. `listPrice` viaja como precio original.
+    const conDescuento = typeof item.onlinePrice === 'number';
+    return {
+      idPlade: product.idPlade,
+      title: item.title,
+      quantity: item.quantity,
+      price: conDescuento ? item.onlinePrice : item.price,
+      listPrice: item.price,
+      ivaRate: product.ivaRate || 0,
+    };
   });
 
   if (!pladeItems.every(Boolean)) {
@@ -1889,15 +1906,33 @@ function rechazarSinPermisoDeNiveles(req, res) {
   return true;
 }
 
+/**
+ * Cifras del descuento de compra online (reemplazó a los niveles el 2026-10-08), sacadas de los
+ * pedidos guardados: cuántos llevaron el descuento y cuánto se descontó. No depende de Supabase.
+ */
+function resumenDescuentoOnline() {
+  const conDescuento = loadOrdersLocation().filter(
+    (o) => !o.cancelledAt && o.discountApplied && o.discountApplied.tier === 'ONLINE'
+  );
+  const redondear = (n) => Math.round(n * 100) / 100;
+  return {
+    percent: porcentajeDescuentoOnline(),
+    pedidos: conDescuento.length,
+    descontado: redondear(conDescuento.reduce((s, o) => s + (Number(o.discountApplied.amount) || 0), 0)),
+    vendido: redondear(conDescuento.reduce((s, o) => s + (Number(o.total) || 0), 0)),
+  };
+}
+
 app.get('/api/admin/loyalty/levels', requireAdminRole('master', 'admin'), async (req, res) => {
   if (rechazarSinPermisoDeNiveles(req, res)) return;
+  const descuentoOnline = resumenDescuentoOnline();
   if (!isLoyaltyConfigured()) {
-    return res.json({ configurado: false, migracionPendiente: false, niveles: [], totalClientes: 0, resumen: null });
+    return res.json({ configurado: false, migracionPendiente: false, niveles: [], totalClientes: 0, resumen: null, descuentoOnline });
   }
   try {
     const clientes = await listLoyaltyLevels();
     if (clientes === null) {
-      return res.json({ configurado: true, migracionPendiente: true, niveles: [], totalClientes: 0, resumen: null });
+      return res.json({ configurado: true, migracionPendiente: true, niveles: [], totalClientes: 0, resumen: null, descuentoOnline });
     }
     res.json({
       configurado: true,
@@ -1905,6 +1940,7 @@ app.get('/api/admin/loyalty/levels', requireAdminRole('master', 'admin'), async 
       niveles: resumirNiveles(clientes),
       totalClientes: clientes.length,
       resumen: resumenGeneral(clientes),
+      descuentoOnline,
     });
   } catch (err) {
     console.error('No se pudieron cargar los niveles de fidelidad:', err.message);
@@ -3975,8 +4011,8 @@ app.post('/api/orders', (req, res) => {
   //      `purchases` y saltar a nivel DIAMANTE — 20% de descuento permanente sin pagar nada.
   //      (Se limita solo porque anular el pedido después lo saca del cálculo, ver migración 004.)
   //
-  // La tienda muestra `product.price` sin modificar —el descuento de fidelidad se aplica al total,
-  // no al artículo— así que el precio del catálogo es exactamente el que vio el comprador.
+  // La tienda muestra `product.price` sin modificar en el catálogo —el descuento de compra online
+  // se calcula acá abajo— así que el precio del catálogo es exactamente el que vio el comprador.
   const catalogoPorId = new Map(loadProducts().map((p) => [p.id, p]));
   const desconocidos = [];
   const normalizedItems = items.map((item) => {
@@ -4074,25 +4110,17 @@ app.post('/api/orders', (req, res) => {
   // invitado podía declarar el total que quisiera. Ahora el número del cliente ya no entra en
   // ningún cálculo — se sigue exigiendo en el cuerpo solo para no romper el contrato de la API.
   //
-  // El descuento de fidelidad se resuelve contra Supabase con la service_role key, nunca con un
-  // porcentaje mandado por el navegador. Si Supabase no está configurado o la consulta falla, el
-  // pedido sale sin descuento en vez de romper el checkout.
-  let finalTotal = round2(merchandiseSubtotal + deliveryFee);
+  // Descuento de compra online: un solo porcentaje para todo el que compra con sesión iniciada (el
+  // checkout la exige). Reemplazó a los niveles de fidelidad el 2026-10-08 — ver descuento-online.js.
+  // El porcentaje sale del servidor, nunca de lo que mande el navegador.
+  let pricedItems = normalizedItems;
   let discountApplied = null;
-  let loyaltyResolved = false;
-  if (userId && isLoyaltyConfigured()) {
-    try {
-      const loyalty = await getLoyaltyForUser(userId);
-      const discountAmount = round2(merchandiseSubtotal * (loyalty.discountPercent / 100));
-      finalTotal = round2(merchandiseSubtotal - discountAmount + deliveryFee);
-      if (loyalty.discountPercent > 0) {
-        discountApplied = { tier: loyalty.tier, percent: loyalty.discountPercent, amount: discountAmount };
-      }
-      loyaltyResolved = true;
-    } catch (err) {
-      console.error(`No se pudo calcular el nivel de fidelidad para ${userId}:`, err.message);
-    }
+  if (userId) {
+    const resultado = aplicarDescuentoOnline(normalizedItems);
+    pricedItems = resultado.items;
+    discountApplied = resultado.discountApplied;
   }
+  const finalTotal = round2(merchandiseSubtotal - (discountApplied ? discountApplied.amount : 0) + deliveryFee);
 
   const createdAt = new Date().toISOString();
   const orderId = crypto.randomBytes(16).toString('hex');
@@ -4137,7 +4165,7 @@ app.post('/api/orders', (req, res) => {
       paymentHolderName,
       deliveryZone,
       deliveryFee,
-      items: normalizedItems,
+      items: pricedItems,
       total: finalTotal,
       bcvRate,
       trmRate,
@@ -4176,7 +4204,7 @@ app.post('/api/orders', (req, res) => {
           paymentHolderName,
           deliveryZone,
           deliveryFee,
-          items: normalizedItems,
+          items: pricedItems,
           total: finalTotal,
           bcvRate,
           trmRate,
@@ -4207,7 +4235,7 @@ app.post('/api/orders', (req, res) => {
     // Se guarda acá (no en Supabase) para poder ofrecer "Repetir compra" desde el historial sin
     // depender de una migración de esquema — mismo esquema de acceso que /pdf, /proof, /receipt
     // más abajo (el orderId al azar ES el token, ver GET /api/orders/:orderId/items).
-    items: normalizedItems,
+    items: pricedItems,
     // nombre/telefono/total no hacían falta acá hasta ahora (ya vivían en el PDF y en
     // customers.json) — se agregan para mostrarlos en la pantalla de escaneo de salidas
     // (POST /api/admin/scan) sin tener que cruzar con otro archivo.
@@ -4219,6 +4247,9 @@ app.post('/api/orders', (req, res) => {
     cedula: `${idType}-${cedula}`,
     correo,
     total: finalTotal,
+    // Para que el ticket impreso y la ficha del panel muestren el descuento y el delivery.
+    deliveryFee,
+    discountApplied,
     dispatchedAt: null,
     dispatchedBy: null,
     createdAt,
@@ -4256,10 +4287,11 @@ app.post('/api/orders', (req, res) => {
   };
   saveCustomers(customers);
 
-  if (userId && loyaltyResolved) {
+  if (userId && isLoyaltyConfigured()) {
     // Best-effort: no bloquea la respuesta del checkout si falla, mismo espíritu que
-    // submitOrderToPlade() más abajo. amount_usd = subtotal de mercancía ANTES del descuento y sin
-    // el fee de delivery (ver supabase/002_purchases.sql).
+    // submitOrderToPlade() más abajo. Ya no decide ningún nivel (se retiraron el 2026-10-08), pero
+    // se sigue guardando: es el historial de compras de cada cuenta. amount_usd = subtotal de
+    // mercancía ANTES del descuento y sin el fee de delivery (ver supabase/002_purchases.sql).
     recordPurchase({ userId, orderId, amountUsd: merchandiseSubtotal, country, paymentMethod }).catch((err) => {
       console.error(`No se pudo registrar la compra ${orderId} para el nivel de fidelidad:`, err.message);
     });
@@ -4267,9 +4299,10 @@ app.post('/api/orders', (req, res) => {
 
   const zoneNote = deliveryMethod === 'homeDelivery' && deliveryZone ? ` | Zona delivery: ${DELIVERY_ZONE_LABELS[deliveryZone] || deliveryZone} (+$${deliveryFee})` : '';
   const nota = `${nombre} | ${idType}-${cedula} | Tel: ${telefono} | Correo: ${correo} | ${estado}, ${ciudad}, ${parroquia} | ${address} | Entrega: ${deliveryMethod} | Pago: ${paymentMethod}${zoneNote}`;
-  // A propósito sigue mandando el precio completo de cada ítem, sin el descuento de fidelidad
-  // (decisión del dueño: no se toca la integración con PLADE en este paso — ver HANDOFF/plan).
-  submitOrderToPlade({ orderId, nota, items: normalizedItems, country }).catch((err) => {
+  // Desde el 2026-10-08 va con el precio unitario YA descontado (decisión del dueño), para que la
+  // factura de PLADE cuadre con lo cobrado. La nota deja constancia del descuento.
+  const notaPlade = discountApplied ? `${nota} | ${etiquetaDescuento(discountApplied)}: -$${discountApplied.amount.toFixed(2)}` : nota;
+  submitOrderToPlade({ orderId, nota: notaPlade, items: pricedItems, country }).catch((err) => {
     console.error(`Error enviando pedido ${orderId} a PLADE:`, err.message);
   });
 
@@ -4648,6 +4681,13 @@ app.post('/api/chat', async (req, res) => {
     console.error('Chat error:', err.message);
     res.status(500).json({ error: 'No se pudo generar una respuesta en este momento.' });
   }
+});
+
+// Porcentaje del descuento de compra online, para que la tienda lo muestre (franja, carrito,
+// checkout). Público y sin datos de nadie. El que se cobra se recalcula al crear el pedido.
+app.get('/api/descuento-online', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json({ percent: porcentajeDescuentoOnline() });
 });
 
 app.get('/api/bcv', (req, res) => {

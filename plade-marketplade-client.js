@@ -269,7 +269,7 @@ function formatPladeDate(d) {
 
 /**
  * Arma (pero no garantiza que PLADE guarde de verdad, ver nota arriba) un pedido externo.
- * `order.items` = [{ idPlade, title, quantity, price, ivaRate }], `order.bcvRate` = tasa BCV del
+ * `order.items` = [{ idPlade, title, quantity, price, listPrice?, ivaRate }] (price = lo cobrado), `order.bcvRate` = tasa BCV del
  * momento, `order.orderId` = nuestro propio ID de pedido (mismo que ya usamos para el PDF/código
  * de barras), `order.nota` = texto libre — como no hay forma de crear un cliente real por API,
  * aquí es donde se guardan los datos reales del comprador (nombre/cédula/teléfono/dirección) para
@@ -293,6 +293,8 @@ async function saveOrderToPlade(order) {
 
   order.items.forEach((item, i) => {
     const precioBs = Math.round(item.price * order.bcvRate * 100) / 100;
+    // `item.price` ya viene con el descuento de compra online; `listPrice` es el de catálogo.
+    const precioOriginalBs = Math.round((item.listPrice ?? item.price) * order.bcvRate * 100) / 100;
     Object.assign(fields, {
       [`productos[${i}][idp]`]: item.idPlade,
       [`productos[${i}][can]`]: item.quantity,
@@ -302,7 +304,7 @@ async function saveOrderToPlade(order) {
       [`productos[${i}][precio]`]: item.price,
       [`productos[${i}][precio_bs]`]: precioBs,
       [`productos[${i}][precio_p_detal]`]: item.price,
-      [`productos[${i}][precio_original_bs]`]: precioBs,
+      [`productos[${i}][precio_original_bs]`]: precioOriginalBs,
       [`productos[${i}][ivap]`]: 0,
       [`productos[${i}][id_iva]`]: resolveIdIva(item.ivaRate),
       [`productos[${i}][tipo_precio]`]: '',
