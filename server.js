@@ -416,7 +416,7 @@ const DELIVERY_METHOD_LABELS = {
 };
 // Espejo de tienda_web/lib/pickup-stores.ts (PICKUP_STORES_BY_COUNTRY, todas las sedes).
 const PICKUP_STORE_LABELS = {
-  avBolivarNorte: 'Sede Valencia, C.C. Salva Market',
+  avBolivarNorte: 'Sede Valencia, C.C. Salva Mall (Antg. Éxito)',
   avUniversidad: 'Sede Naguanagua, C.C. La Granja',
   miami: 'Sede Miami, Miami, Florida',
   bogota: 'Sede Bogotá, Bogotá',
