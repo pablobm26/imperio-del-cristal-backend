@@ -1098,10 +1098,20 @@ app.get('/', (req, res) => {
 // --- Panel nuevo (cristal44.com/admin): login con usuario/contraseña + escaneo de salidas ---
 // Token stateless firmado con HMAC (sin sesiones en memoria ni tabla nueva en Supabase) — el
 // frontend lo guarda (localStorage) y lo manda en el header Authorization en cada request. Expira a
-// las 12 horas (una jornada de trabajo; si hace falta más, se vuelve a loguear). No usa cookies a
+// las 12 horas (una jornada de trabajo; si hace falta más, se vuelve a loguear) — salvo el master
+// (el dueño), que dura 31 días, ver ADMIN_TOKEN_TTL_MASTER_MS. No usa cookies a
 // propósito: tienda_web (cristal44.com) y este backend (onrender.com) son dominios distintos, y un
 // bearer token evita todo el tema de cookies cross-origin.
 const ADMIN_TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
+// El DUEÑO (rol `master`) mantiene la sesión abierta 31 días, para no tener que volver a entrar cada
+// mañana en el celular. Solo el master, a propósito: el token es sin estado y no se puede cancelar
+// desde el servidor, y los permisos de cada cuenta viajan dentro de él. Para el resto de las cuentas,
+// 31 días significaría que un empleado dado de baja (o con un permiso retirado) conserva ese acceso
+// hasta un mes — por eso siguen en 12 horas. Para el master no hay permisos que revocar (ya tiene
+// todos, ver permisosEfectivos). **Si se pierde un teléfono con la sesión del dueño abierta, se
+// cancelan TODAS las sesiones cambiando ADMIN_TOKEN_SECRET en Render**: los tokens ya emitidos dejan
+// de verificar y cada quien tiene que volver a entrar.
+const ADMIN_TOKEN_TTL_MASTER_MS = 31 * 24 * 60 * 60 * 1000;
 
 // `actor` identifica QUIÉN hizo la acción, para auditoría: { sub, username }. `sub` es el uuid de
 // la fila en admin_users, o null cuando el login vino por el respaldo de variables de entorno.
@@ -1126,7 +1136,7 @@ function signAdminToken(role, actor = {}) {
       // hasta el próximo login de esa persona. Para lo destructivo eso no alcanza, así que
       // `datos-prueba` se vuelve a validar contra la base en el momento de usarlo.
       p: permisosEfectivos(actor),
-      exp: Date.now() + ADMIN_TOKEN_TTL_MS,
+      exp: Date.now() + (role === 'master' ? ADMIN_TOKEN_TTL_MASTER_MS : ADMIN_TOKEN_TTL_MS),
     })
   ).toString('base64url');
   const signature = crypto.createHmac('sha256', ADMIN_TOKEN_SECRET).update(payload).digest('base64url');
@@ -5137,7 +5147,14 @@ async function enviarATodos(destinos, aviso) {
   await Promise.all(
     destinos.map(async (s) => {
       try {
-        await webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys }, carga, { TTL: 3600 });
+        // `urgency: 'high'` es lo que hace que el aviso llegue AL INSTANTE en Android. Sin esto la
+        // librería manda `Urgency: normal` (su valor por defecto), y Google lo entrega como mensaje
+        // de prioridad normal: con el teléfono quieto y la pantalla apagada Android está en modo de
+        // ahorro (Doze) y agrupa esos mensajes para soltarlos cada tanto, a veces con minutos de
+        // retraso. Apple no tiene ese mecanismo, por eso en iPhone siempre llegaron al momento. Una
+        // venta nueva es justo lo que no puede esperar, y cada aviso se muestra siempre (ver
+        // `userVisibleOnly` en el panel), que es la condición para que Google respete la prioridad alta.
+        await webpush.sendNotification({ endpoint: s.endpoint, keys: s.keys }, carga, { TTL: 3600, urgency: 'high' });
         enviados += 1;
       } catch (err) {
         if (err && (err.statusCode === 404 || err.statusCode === 410)) muertas.push(s.endpoint);
