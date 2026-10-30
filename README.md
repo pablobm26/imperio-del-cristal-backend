@@ -108,6 +108,7 @@ Ninguna es obligatoria a nivel técnico: el servidor arranca sin todas. Pero var
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | el checkout funciona como invitado, sin descuentos de fidelidad | Cuentas de cliente y niveles de fidelidad. **`SUPABASE_SERVICE_ROLE_KEY` nunca va en Vercel ni en el frontend** — sólo acá. |
 | `RESEND_API_KEY`, `CART_REMINDER_FROM_EMAIL` | no se envía ningún recordatorio | Correos de carrito abandonado. Van juntas. |
 | `CRON_SECRET` | el endpoint del cron rechaza todo, así que los recordatorios nunca se disparan | Protege `GET /cron/...`, que se llama una vez al día desde un cron externo. |
+| `MERCANTIL_CLIENT_ID`, `MERCANTIL_MERCHANT_ID`, `MERCANTIL_INTEGRATOR_ID`, `MERCANTIL_TERMINAL_ID`, `MERCANTIL_SECRET_KEY`, `MERCANTIL_MERCHANT_PHONE` | la validación automática de Pago Móvil queda apagada y los pagos se confirman a mano, como siempre | Consulta `POST /mobile-payment/search` de Mercantil para confirmar solo un Pago Móvil a la cuenta jurídica (`mercantil-client.js`). Van las seis juntas. `MERCANTIL_BASE_URL` apunta al **sandbox** por defecto; cambiarla a producción es una decisión explícita. Ver `PROPUESTA-PAGO-MOVIL-MERCANTIL.md`. |
 
 El cliente de PLADE acepta además tres overrides que **normalmente no hace falta tocar** — están sólo para no tener que editar código si algo cambia del lado de ellos:
 

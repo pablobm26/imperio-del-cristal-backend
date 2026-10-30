@@ -7,6 +7,19 @@ module.exports = {
   zinliEmail: 'fabiannopacia@gmail.com',
   binancePayId: '1088198677',
   binancePayEmail: 'fabiannopacia@gmail.com',
+  // WhatsApp de atención al cliente. Espejo de tienda_web/lib/social-links.ts (ahí está la fuente
+  // de verdad). Antes chat.js usaba el teléfono del Pago Móvil para esto, que es otra cosa: es el
+  // número de una cuenta bancaria, no el de soporte.
+  soporteWhatsapp: '+58 424-4576249',
+  // Pago Móvil jurídico (Mercantil). Mismo teléfono que el Banesco de abajo a propósito: una sola
+  // línea afiliada a las dos cuentas. Si quedan vacíos, chat.js no menciona el método.
+  pagoMovilJuridicoPhone: '0414-5633683',
+  pagoMovilJuridicoRif: 'J-50215248-2',
+  pagoMovilJuridicoBank: 'MERCANTIL (0105)',
+  pagoMovilJuridicoHolder: 'EL IMPERIO DEL CRISTAL 44, C.A.',
+  // Pago Móvil personal (Banesco) — segunda opción.
+  // Corte del Banesco personal: 31/10/2026 10:00pm hora Venezuela. Después chat.js deja de darlo.
+  pagoMovilBanescoHasta: '2026-11-01T02:00:00Z',
   pagoMovilPhone: '0414-5633683',
   pagoMovilCedula: 'V-13818713',
   pagoMovilBank: 'BANESCO (0134)',

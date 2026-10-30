@@ -15,6 +15,27 @@ function getClient() {
   return client;
 }
 
+// Los dos Pago Móvil que puede dar el asistente. El jurídico (Mercantil) solo cuando el dueño ya
+// completó sus datos; el personal (Banesco) solo hasta su fecha de corte. Mismas dos reglas que
+// isAvailable() en tienda_web/lib/payment-methods.ts — si cambian allá, cambian acá.
+function lineasPagoMovil(now = Date.now()) {
+  const lineas = [];
+  if (PaymentInfo.pagoMovilJuridicoPhone && PaymentInfo.pagoMovilJuridicoRif) {
+    lineas.push(
+      `- Pago Móvil (cuenta de la empresa, el recomendado): Teléfono ${PaymentInfo.pagoMovilJuridicoPhone}, RIF ${PaymentInfo.pagoMovilJuridicoRif}, Banco ${PaymentInfo.pagoMovilJuridicoBank}, Titular ${PaymentInfo.pagoMovilJuridicoHolder}`
+    );
+  }
+  if (now < Date.parse(PaymentInfo.pagoMovilBanescoHasta)) {
+    lineas.push(
+      `- Pago Móvil (Banesco, disponible solo hasta el 31/10/2026 a las 10:00pm): Teléfono ${PaymentInfo.pagoMovilPhone}, Cédula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}`
+    );
+  }
+  if (lineas.length === 0) {
+    return '- Pago Móvil: pídele al cliente que escriba por WhatsApp para darle los datos actualizados.';
+  }
+  return lineas.join('\n');
+}
+
 const WEEKDAY_TO_NUM = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 
 function isBusinessOpen(now = new Date()) {
@@ -152,11 +173,12 @@ MÉTODOS DE PAGO ACEPTADOS (ya no se acepta tarjeta, se sacó del checkout):
 - Zinli: ${PaymentInfo.zinliEmail}
 - Zelle: ${PaymentInfo.zelleEmail} (titular: ${PaymentInfo.zelleHolder})
 - Binance Pay ID (USDT): ${PaymentInfo.binancePayId} (también se puede enviar al correo ${PaymentInfo.binancePayEmail})
-- Pago Móvil: Teléfono ${PaymentInfo.pagoMovilPhone}, Cédula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}
+${lineasPagoMovil()}
+- Cashea: el cliente paga la inicial en su app de Cashea eligiendo El Imperio del Cristal como comercio, y Cashea le financia el resto en cuotas. En el checkout se le pide el número de orden de Cashea y la captura.
 
 Para todos los métodos excepto efectivo, el checkout le va a pedir al cliente adjuntar una captura de pantalla del pago — es obligatorio, no opcional. Los pagos se confirman de forma manual, no hay pasarela en tiempo real.
 
-CONTACTO PARA CASOS QUE NO PUEDAS RESOLVER: WhatsApp ${PaymentInfo.pagoMovilPhone}
+CONTACTO PARA CASOS QUE NO PUEDAS RESOLVER: WhatsApp ${PaymentInfo.soporteWhatsapp}
 
 INSTRUCCIONES:
 - Responde siempre en español, de forma breve, amable y profesional.

@@ -424,7 +424,9 @@ const PICKUP_STORE_LABELS = {
 };
 // Espejo de tienda_web/lib/payment-methods.ts (PAYMENT_METHODS_BY_COUNTRY, los 3 países).
 const PAYMENT_METHOD_LABELS = {
-  pagoMovil: 'Pago Móvil (Bs)',
+  pagoMovilJuridico: 'Pago Móvil Mercantil (Bs)',
+  pagoMovil: 'Pago Móvil Banesco (Bs)',
+  cashea: 'Cashea (cuotas)',
   binance: 'Binance (USDT)',
   zinli: 'Zinli (Panamá)',
   zelle: 'Zelle (USD)',
@@ -575,7 +577,7 @@ function drawReceiptBody(doc, order, barcodeBuffer) {
   doc.text(`Método: ${PAYMENT_METHOD_LABELS[order.paymentMethod] || order.paymentMethod}`);
   if (order.reference) doc.text(`Referencia: ${order.reference}`);
   if (order.paymentHolderName) doc.text(`Titular del pago: ${order.paymentHolderName}`);
-  if (order.paymentMethod === 'pagoMovil' && order.bcvRate) {
+  if ((order.paymentMethod === 'pagoMovil' || order.paymentMethod === 'pagoMovilJuridico') && order.bcvRate) {
     doc.text(`Monto a pagar: ${formatBs(order.total * order.bcvRate)}`);
     doc.text(`(tasa BCV: ${formatBs(order.bcvRate)} por $1)`);
   }
