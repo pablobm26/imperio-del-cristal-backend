@@ -1,5 +1,6 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const PaymentInfo = require('./payment_info');
+const { isMercantilConfigured } = require('./mercantil-client');
 
 const MODEL = 'claude-sonnet-5';
 const TIMEZONE = 'America/Caracas';
@@ -21,6 +22,16 @@ function getClient() {
 // Cashea se anuncia distinto segun este en pausa o no. Mientras la afiliacion del comercio no
 // este lista, el asistente NO puede decirle a un cliente que pague por ahi: el checkout lo tiene
 // deshabilitado y el servidor rechaza el pedido.
+// Con la validacion automatica de Mercantil configurada, el Pago Movil a la cuenta de la empresa
+// deja de pedir captura: el pago se confirma contra el banco. El asistente no puede seguir
+// diciendo que la captura es obligatoria para todo, porque el cliente la buscaria sin encontrarla.
+function lineaComprobante() {
+  if (isMercantilConfigured()) {
+    return 'El Pago Movil a la cuenta de la empresa se confirma solo contra el banco con el numero de referencia: ahi NO se pide captura. Para el resto de los metodos, menos efectivo, el checkout si pide adjuntar la captura del pago y es obligatorio.';
+  }
+  return 'Para todos los metodos excepto efectivo, el checkout le va a pedir al cliente adjuntar una captura de pantalla del pago — es obligatorio, no opcional. Los pagos se confirman de forma manual, no hay pasarela en tiempo real.';
+}
+
 function lineaCashea() {
   if (PaymentInfo.casheaPausaAviso) {
     return `- Cashea: TODAVIA NO SE PUEDE USAR (${PaymentInfo.casheaPausaAviso}). Aparece en el checkout pero sale deshabilitado. Si el cliente pregunta, dile que esta en camino y ofrecele otro metodo; nunca le digas que pague por Cashea.`;
@@ -186,7 +197,7 @@ MÉTODOS DE PAGO ACEPTADOS (ya no se acepta tarjeta, se sacó del checkout):
 ${lineasPagoMovil()}
 ${lineaCashea()}
 
-Para todos los métodos excepto efectivo, el checkout le va a pedir al cliente adjuntar una captura de pantalla del pago — es obligatorio, no opcional. Los pagos se confirman de forma manual, no hay pasarela en tiempo real.
+${lineaComprobante()}
 
 CONTACTO PARA CASOS QUE NO PUEDAS RESOLVER: WhatsApp ${PaymentInfo.soporteWhatsapp}
 

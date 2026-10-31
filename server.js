@@ -16,6 +16,7 @@ const adminUsers = require('./admin-users');
 const { FUNCIONES, permisosEfectivos, tienePermiso, normalizarPermisos } = require('./permisos');
 const productImages = require('./product-images');
 const PaymentInfo = require('./payment_info');
+const { isMercantilConfigured } = require('./mercantil-client');
 const {
   isLoyaltyConfigured,
   getLoyaltyForUser,
@@ -2492,7 +2493,16 @@ app.post('/api/cart/check', async (req, res) => {
   });
 
   const problemas = resultado.filter((r) => r.estado !== 'ok');
-  res.json({ ok: problemas.length === 0, fuente, items: resultado, problemas });
+  // El checkout ya espera por esta respuesta antes de mostrar los datos de pago, asi que
+  // viaja aca en vez de en una peticion aparte: con la autovalidacion activa, el Pago Movil
+  // a la cuenta de la empresa deja de pedir captura del comprobante.
+  res.json({
+    ok: problemas.length === 0,
+    fuente,
+    items: resultado,
+    problemas,
+    autovalidacionPagoMovil: isMercantilConfigured(),
+  });
 });
 
 // --- Contador de visitas ---
@@ -4011,7 +4021,12 @@ app.post('/api/orders', (req, res) => {
     return res.status(400).json({ error: 'Faltan los productos o el total del pedido.' });
   }
   // Efectivo se paga al recibir el pedido — no hay captura de pago que pedir en ese momento.
-  if (paymentMethod !== 'cash' && !req.file) {
+  // Y el Pago Movil a la cuenta de la empresa tampoco la necesita CUANDO la validacion
+  // automatica contra Mercantil esta configurada: ahi el pago se confirma contra el banco,
+  // no contra una imagen. Si las credenciales no estan cargadas, la captura vuelve a ser
+  // obligatoria sola; sin una cosa ni la otra no habria forma de saber si el cliente pago.
+  const pagoSeVerificaSolo = paymentMethod === 'pagoMovilJuridico' && isMercantilConfigured();
+  if (paymentMethod !== 'cash' && !pagoSeVerificaSolo && !req.file) {
     return res.status(400).json({ error: 'Falta la captura del pago.' });
   }
   // Metodos anunciados pero todavia no activos (Cashea mientras se completa la afiliacion del
