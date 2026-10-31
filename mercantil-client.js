@@ -1,5 +1,15 @@
-// Cliente de la API de Mercantil Banco — por ahora solo la consulta que valida un Pago Móvil que
-// el cliente ya hizo: POST /mobile-payment/search.
+// Cliente de las APIs de Mercantil Banco. Dos operaciones, que son dos formas distintas de cobrar:
+//
+//   1. buscarPagoMovil()  POST /mobile-payment/search  — REACTIVA. El cliente ya hizo el Pago
+//      Móvil desde su banco y nosotros preguntamos "¿entró este pago?". Sirve para dejar de
+//      revisar comprobantes a mano, pero el cliente igual se va de la tienda a pagar.
+//
+//   2. cobrarC2P()        POST /payment/c2p           — ACTIVA. El cliente no se va a ningún
+//      lado: escribe su teléfono, su cédula, su banco y una clave temporal que pide por los
+//      canales de SU banco, y el cobro se ejecuta en línea con respuesta inmediata. Esto es lo
+//      que de verdad automatiza el pago móvil. Requiere estar afiliado al servicio C2P.
+//
+//   anularC2P() revierte un cobro C2P con su referencia.
 //
 // Propuesta completa (vías, arquitectura y reglas de conciliación): PROPUESTA-PAGO-MOVIL-MERCANTIL.md
 // en la raíz del proyecto. El algoritmo de cifrado y la forma de cada request salen del código
@@ -144,13 +154,17 @@ async function buscarPagoMovil({ montoBs, referencia, telefonoCliente, cedulaCli
     payment_reference: String(referencia).trim(),
     trx_date: fecha || fechaVenezuela(),
   };
-  if (cedulaCliente) {
+  // OJO: el ejemplo oficial de /mobile-payment/search NO manda `destination_id`. Se deja detrás de
+  // una variable porque mandar un campo que el API no espera es una forma conocida de que la
+  // búsqueda no devuelva nada, y eso se ve igual que "el pago no existe".
+  // Ver search-c2p/modules/searchC2p.js en github.com/apimercantil/api-playground.
+  if (cedulaCliente && process.env.MERCANTIL_SEARCH_WITH_ID === '1') {
     search_by.destination_id = encrypt(formatId(cedulaCliente), secretKey);
   }
   // La colección de Postman del banco escribe este campo con una "n" de más
-  // (`destinantion_mobile_number`) mientras el código del playground usa el nombre correcto. Uno de
-  // los dos está mal y solo una prueba en sandbox lo dice. Esta variable permite cambiarlo sin
-  // tocar el código cuando se haga esa prueba.
+  // (`destinantion_mobile_number`). El código oficial del playground usa el nombre correcto, así
+  // que lo más probable es que el typo esté en la documentación; se deja la variable por si el
+  // gateway de certificación resulta esperar el nombre con el error.
   if (process.env.MERCANTIL_TYPO_DESTINATION === '1') {
     search_by.destinantion_mobile_number = search_by.destination_mobile_number;
     delete search_by.destination_mobile_number;
@@ -205,6 +219,155 @@ async function buscarPagoMovil({ montoBs, referencia, telefonoCliente, cedulaCli
   return { ok: true, encontrado, respuesta: payload };
 }
 
+// --------------------------------------------------------------------------------------------
+// C2P: cobrar en línea, sin comprobante
+// --------------------------------------------------------------------------------------------
+
+/**
+ * Códigos de respuesta del API de C2P, según api_c2p_tipo_de_errores_0.pdf del banco.
+ *
+ * ⚠️ EL 401 NO ES UN PROBLEMA DE CREDENCIALES. El banco devuelve 401 para rechazos de NEGOCIO:
+ * fondos insuficientes, clave temporal errada, límite diario excedido, banco no afiliado, cédula
+ * o teléfono que no corresponden. Tratarlo como "mis credenciales están mal" lleva a reintentar
+ * y a alertar al dueño por un cliente que simplemente no tenía saldo.
+ */
+const C2P_APROBADO = '0000';
+
+function clasificarRespuestaC2P(status, payload) {
+  const codigo = payload?.error_list?.[0]?.code || payload?.code || null;
+  const descripcion = payload?.error_list?.[0]?.description || payload?.description || null;
+  if (status === 200 && (!codigo || codigo === C2P_APROBADO)) {
+    return { resultado: 'aprobado', codigo: codigo || C2P_APROBADO, descripcion };
+  }
+  if (status === 401) {
+    // Rechazo del banco emisor. El pedido NO se cobró; hay que dejar que el cliente reintente.
+    return { resultado: 'rechazado', codigo, descripcion };
+  }
+  if (status === 400) {
+    // Nuestra mensajería está mal armada: es un bug nuestro, no del cliente.
+    return { resultado: 'mensaje_invalido', codigo, descripcion };
+  }
+  return { resultado: 'error_banco', codigo, descripcion };
+}
+
+/**
+ * Cobra (o anula) por Pago Móvil C2P. El dinero se mueve en esta llamada: no es una consulta.
+ *
+ * @param {object} p
+ * @param {number} p.montoBs          Monto en bolívares. Separador decimal ".".
+ * @param {string} p.telefonoCliente  Teléfono afiliado del cliente pagador.
+ * @param {string} p.cedulaCliente    Cédula/RIF del cliente pagador (V12345678).
+ * @param {number|string} p.bancoCliente Código del banco donde está afiliado ESE teléfono.
+ * @param {string} p.claveC2P         Clave temporal de compra que el cliente pide a su banco.
+ * @param {string} p.invoiceNumber    Nuestro identificador del pedido. Es lo único que después
+ *                                    permite amarrar el movimiento bancario con la venta.
+ * @param {string} [p.ipCliente]      IP del cliente pagador (el banco la exige).
+ * @param {string} [p.navegadorCliente]
+ * @param {('compra'|'anulacion')} [p.tipo]
+ * @param {string} [p.referencia]     Referencia del cobro original; obligatoria si tipo=anulacion.
+ * @returns {Promise<{ok:boolean, resultado:string, codigo:string|null, descripcion:string|null,
+ *                     referencia:string|null, respuesta:any, error?:string}>}
+ */
+async function cobrarC2P({
+  montoBs,
+  telefonoCliente,
+  cedulaCliente,
+  bancoCliente,
+  claveC2P,
+  invoiceNumber,
+  ipCliente,
+  navegadorCliente,
+  tipo = 'compra',
+  referencia,
+}) {
+  const { clientId, merchantId, integratorId, terminalId, secretKey } = credentialsFromEnv();
+
+  if (!Number.isFinite(Number(montoBs)) || Number(montoBs) <= 0) {
+    throw new Error('cobrarC2P necesita un monto en bolívares mayor que cero.');
+  }
+  if (!invoiceNumber) {
+    throw new Error('cobrarC2P necesita invoice_number: es lo que amarra el cobro con el pedido.');
+  }
+  if (!bancoCliente) {
+    throw new Error('cobrarC2P necesita el código del banco del cliente (destination_bank_id).');
+  }
+  if (tipo === 'compra' && !claveC2P) {
+    throw new Error('cobrarC2P necesita la clave temporal de compra del cliente.');
+  }
+  if (tipo === 'anulacion' && !referencia) {
+    throw new Error('Una anulación necesita la referencia del cobro original.');
+  }
+
+  const telefonoComercio = process.env.MERCANTIL_MERCHANT_PHONE;
+  if (!telefonoComercio) {
+    throw new Error('Falta MERCANTIL_MERCHANT_PHONE (el teléfono afiliado de la cuenta jurídica).');
+  }
+
+  const body = {
+    merchant_identify: {
+      integratorId: Number(integratorId),
+      merchantId: Number(merchantId),
+      terminalId: String(terminalId),
+    },
+    client_identify: {
+      // El banco pide la IP del CLIENTE PAGADOR, no la del servidor. Si se manda la del servidor,
+      // todos los cobros salen desde la misma IP y el banco lo puede leer como fraude.
+      ipaddress: ipCliente || '127.0.0.1',
+      browser_agent: String(navegadorCliente || 'cristal44').slice(0, 80),
+      mobile: { manufacturer: 'web' },
+    },
+    transaction_c2p: {
+      amount: Number(Number(montoBs).toFixed(2)),
+      currency: 'ves',
+      // destination = CLIENTE (a quien se le cobra), origin = COMERCIO (quien cobra).
+      destination_bank_id: Number(String(bancoCliente).replace(/\D/g, '')),
+      destination_id: encrypt(formatId(cedulaCliente), secretKey),
+      destination_mobile_number: encrypt(formatPhone(telefonoCliente), secretKey),
+      origin_mobile_number: encrypt(formatPhone(telefonoComercio), secretKey),
+      payment_reference: tipo === 'anulacion' ? String(referencia) : '',
+      trx_type: tipo,
+      payment_method: 'c2p',
+      invoice_number: String(invoiceNumber),
+      twofactor_auth: tipo === 'compra' ? encrypt(String(claveC2P), secretKey) : '',
+    },
+  };
+
+  let res;
+  let payload;
+  try {
+    res = await fetch(`${MERCANTIL_BASE_URL}/payment/c2p`, {
+      method: 'POST',
+      headers: { 'X-IBM-Client-ID': clientId, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    payload = await res.json().catch(() => null);
+  } catch (err) {
+    // ⚠️ UN TIMEOUT NO ES UN COBRO FALLIDO. La petición pudo haber llegado y el dinero pudo
+    // haberse movido: quien llame a esto NO puede reintentar a ciegas ni dar el pedido por
+    // impago. Hay que consultar con buscarPagoMovil() usando el mismo monto antes de decidir.
+    return {
+      ok: false,
+      resultado: 'indeterminado',
+      codigo: null,
+      descripcion: null,
+      referencia: null,
+      respuesta: null,
+      error: `Red/timeout: ${err.message}`,
+    };
+  }
+
+  const { resultado, codigo, descripcion } = clasificarRespuestaC2P(res.status, payload);
+  return {
+    ok: resultado === 'aprobado',
+    resultado,
+    codigo,
+    descripcion,
+    referencia: payload?.transaction_c2p?.payment_reference || payload?.payment_reference || null,
+    respuesta: payload,
+  };
+}
+
 module.exports = {
   MERCANTIL_BASE_URL,
   isMercantilConfigured,
@@ -213,4 +376,7 @@ module.exports = {
   formatId,
   fechaVenezuela,
   buscarPagoMovil,
+  cobrarC2P,
+  clasificarRespuestaC2P,
+  C2P_APROBADO,
 };

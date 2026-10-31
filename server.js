@@ -15,6 +15,7 @@ const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlad
 const adminUsers = require('./admin-users');
 const { FUNCIONES, permisosEfectivos, tienePermiso, normalizarPermisos } = require('./permisos');
 const productImages = require('./product-images');
+const PaymentInfo = require('./payment_info');
 const {
   isLoyaltyConfigured,
   getLoyaltyForUser,
@@ -4012,6 +4013,12 @@ app.post('/api/orders', (req, res) => {
   // Efectivo se paga al recibir el pedido — no hay captura de pago que pedir en ese momento.
   if (paymentMethod !== 'cash' && !req.file) {
     return res.status(400).json({ error: 'Falta la captura del pago.' });
+  }
+  // Metodos anunciados pero todavia no activos (Cashea mientras se completa la afiliacion del
+  // comercio). El checkout los muestra deshabilitados, pero una peticion hecha a mano no pasa
+  // por ahi: un pedido con Cashea entraria como pagado sin que exista forma de cobrarlo.
+  if (paymentMethod === 'cashea' && PaymentInfo.casheaPausaAviso) {
+    return res.status(400).json({ error: `Cashea todavia no esta disponible: ${PaymentInfo.casheaPausaAviso}.` });
   }
 
   // EL PRECIO Y EL NOMBRE SE TOMAN DEL CATÁLOGO, NO DE LO QUE MANDÓ EL NAVEGADOR.

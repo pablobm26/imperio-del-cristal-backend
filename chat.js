@@ -18,6 +18,16 @@ function getClient() {
 // Los dos Pago Móvil que puede dar el asistente. El jurídico (Mercantil) solo cuando el dueño ya
 // completó sus datos; el personal (Banesco) solo hasta su fecha de corte. Mismas dos reglas que
 // isAvailable() en tienda_web/lib/payment-methods.ts — si cambian allá, cambian acá.
+// Cashea se anuncia distinto segun este en pausa o no. Mientras la afiliacion del comercio no
+// este lista, el asistente NO puede decirle a un cliente que pague por ahi: el checkout lo tiene
+// deshabilitado y el servidor rechaza el pedido.
+function lineaCashea() {
+  if (PaymentInfo.casheaPausaAviso) {
+    return `- Cashea: TODAVIA NO SE PUEDE USAR (${PaymentInfo.casheaPausaAviso}). Aparece en el checkout pero sale deshabilitado. Si el cliente pregunta, dile que esta en camino y ofrecele otro metodo; nunca le digas que pague por Cashea.`;
+  }
+  return '- Cashea: el cliente paga la inicial en su app de Cashea eligiendo El Imperio del Cristal como comercio, y Cashea le financia el resto en cuotas. En el checkout se le pide el numero de orden de Cashea y la captura.';
+}
+
 function lineasPagoMovil(now = Date.now()) {
   const lineas = [];
   if (PaymentInfo.pagoMovilJuridicoPhone && PaymentInfo.pagoMovilJuridicoRif) {
@@ -174,7 +184,7 @@ MÉTODOS DE PAGO ACEPTADOS (ya no se acepta tarjeta, se sacó del checkout):
 - Zelle: ${PaymentInfo.zelleEmail} (titular: ${PaymentInfo.zelleHolder})
 - Binance Pay ID (USDT): ${PaymentInfo.binancePayId} (también se puede enviar al correo ${PaymentInfo.binancePayEmail})
 ${lineasPagoMovil()}
-- Cashea: el cliente paga la inicial en su app de Cashea eligiendo El Imperio del Cristal como comercio, y Cashea le financia el resto en cuotas. En el checkout se le pide el número de orden de Cashea y la captura.
+${lineaCashea()}
 
 Para todos los métodos excepto efectivo, el checkout le va a pedir al cliente adjuntar una captura de pantalla del pago — es obligatorio, no opcional. Los pagos se confirman de forma manual, no hay pasarela en tiempo real.
 

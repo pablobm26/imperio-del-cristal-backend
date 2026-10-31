@@ -11,6 +11,10 @@ module.exports = {
   // de verdad). Antes chat.js usaba el teléfono del Pago Móvil para esto, que es otra cosa: es el
   // número de una cuenta bancaria, no el de soporte.
   soporteWhatsapp: '+58 424-4576249',
+  // Cashea en pausa mientras se completa la afiliación del comercio. Mientras el aviso no esté
+  // vacío, chat.js lo anuncia como «próximamente» y el servidor rechaza un pedido con ese método
+  // (la lista del checkout lo deshabilita, pero una petición hecha a mano no pasa por ahí).
+  casheaPausaAviso: 'Activo en los próximos días, en proceso de afiliación',
   // Pago Móvil jurídico (Mercantil). Mismo teléfono que el Banesco de abajo a propósito: una sola
   // línea afiliada a las dos cuentas. Si quedan vacíos, chat.js no menciona el método.
   pagoMovilJuridicoPhone: '0414-5633683',
