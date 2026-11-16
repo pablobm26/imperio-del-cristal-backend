@@ -39,12 +39,6 @@ function lineaCashea() {
   return '- Cashea: el cliente paga la inicial en su app de Cashea eligiendo El Imperio del Cristal como comercio, y Cashea le financia el resto en cuotas. En el checkout se le pide el numero de orden de Cashea y la captura.';
 }
 
-function fechaVenezuelaLegible(iso) {
-  return new Date(iso).toLocaleString('es-VE', {
-    timeZone: 'America/Caracas', day: 'numeric', month: 'long', year: 'numeric',
-  });
-}
-
 // Las dos cuentas de Pago Movil se turnan por calendario (ver payment_info.js). El asistente tiene
 // que dar SOLO la que esta cobrando hoy: dar la otra manda el dinero a una cuenta que no es.
 function lineasPagoMovil(now = Date.now()) {
@@ -56,9 +50,8 @@ function lineasPagoMovil(now = Date.now()) {
     );
   }
   if (now < Date.parse(PaymentInfo.pagoMovilBanescoHasta)) {
-    const hasta = fechaVenezuelaLegible(PaymentInfo.pagoMovilBanescoHasta);
     lineas.push(
-      `- Pago Movil (Banesco): Telefono ${PaymentInfo.pagoMovilPhone}, Cedula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}. Esta cuenta se usa hasta el ${hasta}; despues el Pago Movil pasa a la cuenta de la empresa.`
+      `- Pago Movil (Banesco): Telefono ${PaymentInfo.pagoMovilPhone}, Cedula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}`
     );
   }
   if (lineas.length === 0) {
