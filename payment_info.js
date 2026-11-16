@@ -15,16 +15,17 @@ module.exports = {
   // vacío, chat.js lo anuncia como «próximamente» y el servidor rechaza un pedido con ese método
   // (la lista del checkout lo deshabilita, pero una petición hecha a mano no pasa por ahí).
   casheaPausaAviso: 'Activo en los próximos días, en proceso de afiliación',
-  // Pago Móvil jurídico (Mercantil). Mismo teléfono que el Banesco de abajo a propósito: una sola
-  // línea afiliada a las dos cuentas. Si quedan vacíos, chat.js no menciona el método.
+  // Pago Movil: dos cuentas, una activa a la vez, y mandan las fechas (ver payment-info.ts, que
+  // es el espejo de esto). Hasta el 01/01/2027 cobra la personal de Banesco; a partir de ahi
+  // vuelve la juridica de Mercantil.
+  pagoMovilJuridicoDesde: '2027-01-01T04:00:00Z',
   pagoMovilJuridicoPhone: '0414-5633683',
   pagoMovilJuridicoRif: 'J-50215248-2',
   pagoMovilJuridicoBank: 'MERCANTIL (0105)',
   pagoMovilJuridicoHolder: 'EL IMPERIO DEL CRISTAL 44, C.A.',
-  // Pago Móvil personal (Banesco) — segunda opción.
-  // Corte del Banesco personal: 31/10/2026 10:00pm hora Venezuela. Después chat.js deja de darlo.
-  pagoMovilBanescoHasta: '2026-11-01T02:00:00Z',
-  pagoMovilPhone: '0414-5633683',
-  pagoMovilCedula: 'V-13818713',
+  // Cuenta PERSONAL (cedula), no de la empresa: el chat no debe presentarla como tal.
+  pagoMovilBanescoHasta: '2027-01-01T04:00:00Z',
+  pagoMovilPhone: '0412-7246239',
+  pagoMovilCedula: 'V-13810097',
   pagoMovilBank: 'BANESCO (0134)',
 };

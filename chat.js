@@ -39,20 +39,30 @@ function lineaCashea() {
   return '- Cashea: el cliente paga la inicial en su app de Cashea eligiendo El Imperio del Cristal como comercio, y Cashea le financia el resto en cuotas. En el checkout se le pide el numero de orden de Cashea y la captura.';
 }
 
+function fechaVenezuelaLegible(iso) {
+  return new Date(iso).toLocaleString('es-VE', {
+    timeZone: 'America/Caracas', day: 'numeric', month: 'long', year: 'numeric',
+  });
+}
+
+// Las dos cuentas de Pago Movil se turnan por calendario (ver payment_info.js). El asistente tiene
+// que dar SOLO la que esta cobrando hoy: dar la otra manda el dinero a una cuenta que no es.
 function lineasPagoMovil(now = Date.now()) {
   const lineas = [];
-  if (PaymentInfo.pagoMovilJuridicoPhone && PaymentInfo.pagoMovilJuridicoRif) {
+  const hayJuridico = PaymentInfo.pagoMovilJuridicoPhone && PaymentInfo.pagoMovilJuridicoRif;
+  if (hayJuridico && now >= Date.parse(PaymentInfo.pagoMovilJuridicoDesde)) {
     lineas.push(
-      `- Pago Móvil (cuenta de la empresa, el recomendado): Teléfono ${PaymentInfo.pagoMovilJuridicoPhone}, RIF ${PaymentInfo.pagoMovilJuridicoRif}, Banco ${PaymentInfo.pagoMovilJuridicoBank}, Titular ${PaymentInfo.pagoMovilJuridicoHolder}`
+      `- Pago Movil (cuenta de la empresa): Telefono ${PaymentInfo.pagoMovilJuridicoPhone}, RIF ${PaymentInfo.pagoMovilJuridicoRif}, Banco ${PaymentInfo.pagoMovilJuridicoBank}, Titular ${PaymentInfo.pagoMovilJuridicoHolder}`
     );
   }
   if (now < Date.parse(PaymentInfo.pagoMovilBanescoHasta)) {
+    const hasta = fechaVenezuelaLegible(PaymentInfo.pagoMovilBanescoHasta);
     lineas.push(
-      `- Pago Móvil (Banesco, disponible solo hasta el 31/10/2026 a las 10:00pm): Teléfono ${PaymentInfo.pagoMovilPhone}, Cédula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}`
+      `- Pago Movil (Banesco): Telefono ${PaymentInfo.pagoMovilPhone}, Cedula ${PaymentInfo.pagoMovilCedula}, Banco ${PaymentInfo.pagoMovilBank}. Esta cuenta se usa hasta el ${hasta}; despues el Pago Movil pasa a la cuenta de la empresa.`
     );
   }
   if (lineas.length === 0) {
-    return '- Pago Móvil: pídele al cliente que escriba por WhatsApp para darle los datos actualizados.';
+    return '- Pago Movil: pidele al cliente que escriba por WhatsApp para darle los datos actualizados.';
   }
   return lineas.join('\n');
 }
