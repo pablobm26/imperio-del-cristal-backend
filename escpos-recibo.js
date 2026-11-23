@@ -204,7 +204,7 @@ function componer(pedido, ancho) {
   // número y salía "Descuento [object Object]%". Pedidos de niveles viejos no traen `label`.
   if (pedido.discountApplied && Number(pedido.discountApplied.amount) > 0) {
     const d = pedido.discountApplied;
-    const nombre = d.label ? 'Desc. compra online' : `Descuento ${d.tier || ''}`.trim();
+    const nombre = d.tier === 'BLACKFRIDAY' ? 'Desc. Black Friday' : d.label ? 'Desc. compra online' : `Descuento ${d.tier || ''}`.trim();
     texto(aDosColumnas(`${nombre} -${d.percent}%`, `-${dinero(d.amount)}`, ancho), { crudo: true });
   }
   separador('=');

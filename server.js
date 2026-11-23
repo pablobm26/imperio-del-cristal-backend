@@ -10,7 +10,7 @@ const PDFDocument = require('pdfkit');
 const bwipjs = require('bwip-js');
 const { getChatReply } = require('./chat');
 const { construirRecibo, previsualizarRecibo } = require('./escpos-recibo');
-const { porcentajeDescuentoOnline, minimoDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento } = require('./descuento-online');
+const { porcentajeDescuentoOnline, minimoDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento, configPublica } = require('./descuento-online');
 const { getInventario, mapPladeItemToProduct, isPladeConfigured, saveOrderToPlade, normalizarSucursales } = require('./plade-marketplade-client');
 const adminUsers = require('./admin-users');
 const { FUNCIONES, permisosEfectivos, tienePermiso, normalizarPermisos } = require('./permisos');
@@ -4151,7 +4151,8 @@ app.post('/api/orders', (req, res) => {
   let pricedItems = normalizedItems;
   let discountApplied = null;
   if (userId) {
-    const resultado = aplicarDescuentoOnline(normalizedItems);
+    // El método de pago entra porque Black Friday no aplica con Cashea (ver descuento-online.js).
+    const resultado = aplicarDescuentoOnline(normalizedItems, { metodoPago: paymentMethod });
     pricedItems = resultado.items;
     discountApplied = resultado.discountApplied;
   }
@@ -4721,8 +4722,9 @@ app.post('/api/chat', async (req, res) => {
 // Porcentaje del descuento de compra online, para que la tienda lo muestre (franja, carrito,
 // checkout). Público y sin datos de nadie. El que se cobra se recalcula al crear el pedido.
 app.get('/api/descuento-online', (req, res) => {
-  res.set('Cache-Control', 'public, max-age=300');
-  res.json({ percent: porcentajeDescuentoOnline(), minimo: minimoDescuentoOnline() });
+  // 60 s y no 5 min: al empezar y terminar Black Friday la tienda tiene que enterarse enseguida.
+  res.set('Cache-Control', 'public, max-age=60');
+  res.json(configPublica());
 });
 
 app.get('/api/bcv', (req, res) => {

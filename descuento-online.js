@@ -51,12 +51,63 @@ function minimoDescuentoOnline() {
 const ETIQUETA = 'Descuento compra online';
 
 /**
+ * BLACK FRIDAY 2026 (pedido del dueño el 2026-11-23). Del 27 nov 12:00 a. m. al 28 nov 11:59:59 p. m.
+ * hora de Venezuela (UTC-4), la tienda online cobra 20% de descuento en toda la mercancía, SIN
+ * mínimo de compra, en lugar del 10% desde $30. **No aplica a compras con Cashea** (la nota del
+ * aviso): con Cashea rige la regla normal de siempre. Fuera de esas fechas esto no hace nada.
+ * Las mismas fechas están en tienda_web/lib/promos.ts (el aviso y el contador): cambiarlas juntas.
+ */
+const BLACK_FRIDAY = {
+  inicio: Date.UTC(2026, 10, 27, 4, 0, 0),
+  fin: Date.UTC(2026, 10, 29, 3, 59, 59),
+  percent: 20,
+  minimo: 0,
+  excluye: ['cashea'],
+  etiqueta: 'Descuento Black Friday',
+  tier: 'BLACKFRIDAY',
+};
+
+function promoActiva(ahora = Date.now()) {
+  return ahora >= BLACK_FRIDAY.inicio && ahora <= BLACK_FRIDAY.fin ? BLACK_FRIDAY : null;
+}
+
+/**
+ * Regla de descuento que corresponde a un pedido: la de Black Friday si está en curso y el método de
+ * pago no está excluido; si no, la normal (DESCUENTO_ONLINE_PCT desde DESCUENTO_ONLINE_MINIMO).
+ */
+function reglaDescuento({ metodoPago, ahora } = {}) {
+  const promo = promoActiva(ahora);
+  if (promo && !promo.excluye.includes(String(metodoPago || ''))) {
+    return { percent: promo.percent, minimo: promo.minimo, label: promo.etiqueta, tier: promo.tier };
+  }
+  return { percent: porcentajeDescuentoOnline(), minimo: minimoDescuentoOnline(), label: ETIQUETA, tier: 'ONLINE' };
+}
+
+/** Lo que la tienda pide a GET /api/descuento-online para mostrar el descuento antes de pagar. */
+function configPublica(ahora = Date.now()) {
+  const promo = promoActiva(ahora);
+  const general = reglaDescuento({ ahora });
+  return {
+    percent: general.percent,
+    minimo: general.minimo,
+    normal: { percent: porcentajeDescuentoOnline(), minimo: minimoDescuentoOnline() },
+    promo: promo ? { nombre: 'Black Friday', etiqueta: promo.etiqueta, excluye: promo.excluye, fin: new Date(promo.fin).toISOString() } : null,
+  };
+}
+
+/**
  * Aplica el descuento a los artículos ya normalizados (precio del catálogo).
  * Devuelve los artículos con `onlinePrice` (precio unitario con descuento) y `onlineDiscount`
  * (descuento total de esa línea), más el resumen `discountApplied` (null si el porcentaje es 0).
  * `price` se conserva como el precio de lista, que es lo que el recibo muestra tachado.
  */
-function aplicarDescuentoOnline(items, percent = porcentajeDescuentoOnline(), minimo = minimoDescuentoOnline()) {
+function aplicarDescuentoOnline(items, opciones = {}) {
+  // Firma vieja (items, percent, minimo): se respeta por si algo la sigue usando.
+  const regla =
+    typeof opciones === 'number'
+      ? { percent: opciones, minimo: arguments[2] ?? minimoDescuentoOnline(), label: ETIQUETA, tier: 'ONLINE' }
+      : reglaDescuento(opciones);
+  const { percent, minimo } = regla;
   const subtotal = round2(items.reduce((s, i) => s + i.price * i.quantity, 0));
   if (!percent || subtotal < minimo) {
     return { items, discountApplied: null };
@@ -70,7 +121,7 @@ function aplicarDescuentoOnline(items, percent = porcentajeDescuentoOnline(), mi
   return {
     items: conDescuento,
     // `tier: 'ONLINE'` se mantiene por compatibilidad con lo que lee el panel en pedidos viejos.
-    discountApplied: amount > 0 ? { tier: 'ONLINE', label: ETIQUETA, percent, amount } : null,
+    discountApplied: amount > 0 ? { tier: regla.tier, label: regla.label, percent, amount } : null,
   };
 }
 
@@ -81,4 +132,4 @@ function etiquetaDescuento(discountApplied) {
   return `${nombre} (-${discountApplied.percent}%)`;
 }
 
-module.exports = { porcentajeDescuentoOnline, minimoDescuentoOnline, aplicarDescuentoOnline, etiquetaDescuento, ETIQUETA_DESCUENTO_ONLINE: ETIQUETA };
+module.exports = { porcentajeDescuentoOnline, minimoDescuentoOnline, aplicarDescuentoOnline, reglaDescuento, configPublica, promoActiva, etiquetaDescuento, ETIQUETA_DESCUENTO_ONLINE: ETIQUETA };
