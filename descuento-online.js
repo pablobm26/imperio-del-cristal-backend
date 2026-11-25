@@ -52,16 +52,19 @@ const ETIQUETA = 'Descuento compra online';
 
 /**
  * BLACK FRIDAY 2026 (pedido del dueño el 2026-11-23). Del 27 nov 12:00 a. m. al 28 nov 11:59:59 p. m.
- * hora de Venezuela (UTC-4), la tienda online cobra 20% de descuento en toda la mercancía, SIN
- * mínimo de compra, en lugar del 10% desde $30. **No aplica a compras con Cashea** (la nota del
- * aviso): con Cashea rige la regla normal de siempre. Fuera de esas fechas esto no hace nada.
+ * hora de Venezuela (UTC-4), la tienda online cobra 20% de descuento en toda la mercancía en compras
+ * desde $10 (subtotal de mercancía sin delivery; regla del dueño 2026-11-24).
+ * **Mientras dura, el 10% desde $30 queda EN PAUSA para todos** (2026-11-24): los dos descuentos nunca
+ * se suman ni se reemplazan uno por otro. **No aplica a compras con Cashea** (la nota del aviso), y
+ * como el 10% está en pausa, con Cashea esos dos días no hay descuento online. Por debajo de $10
+ * tampoco. Fuera de esas fechas esto no hace nada y vuelve solo el 10% desde $30.
  * Las mismas fechas están en tienda_web/lib/promos.ts (el aviso y el contador): cambiarlas juntas.
  */
 const BLACK_FRIDAY = {
   inicio: Date.UTC(2026, 10, 27, 4, 0, 0),
   fin: Date.UTC(2026, 10, 29, 3, 59, 59),
   percent: 20,
-  minimo: 0,
+  minimo: 10,
   excluye: ['cashea'],
   etiqueta: 'Descuento Black Friday',
   tier: 'BLACKFRIDAY',
@@ -72,13 +75,15 @@ function promoActiva(ahora = Date.now()) {
 }
 
 /**
- * Regla de descuento que corresponde a un pedido: la de Black Friday si está en curso y el método de
- * pago no está excluido; si no, la normal (DESCUENTO_ONLINE_PCT desde DESCUENTO_ONLINE_MINIMO).
+ * Regla de descuento que corresponde a un pedido. Con Black Friday en curso: la de Black Friday, o
+ * NINGUNA si el método de pago está excluido (Cashea), porque el 10% normal está en pausa esos días.
+ * Sin promo: la normal (DESCUENTO_ONLINE_PCT desde DESCUENTO_ONLINE_MINIMO).
  */
 function reglaDescuento({ metodoPago, ahora } = {}) {
   const promo = promoActiva(ahora);
-  if (promo && !promo.excluye.includes(String(metodoPago || ''))) {
-    return { percent: promo.percent, minimo: promo.minimo, label: promo.etiqueta, tier: promo.tier };
+  if (promo) {
+    const excluido = promo.excluye.includes(String(metodoPago || ''));
+    return { percent: excluido ? 0 : promo.percent, minimo: promo.minimo, label: promo.etiqueta, tier: promo.tier };
   }
   return { percent: porcentajeDescuentoOnline(), minimo: minimoDescuentoOnline(), label: ETIQUETA, tier: 'ONLINE' };
 }
@@ -90,7 +95,8 @@ function configPublica(ahora = Date.now()) {
   return {
     percent: general.percent,
     minimo: general.minimo,
-    normal: { percent: porcentajeDescuentoOnline(), minimo: minimoDescuentoOnline() },
+    // Durante la promo el 10% normal está en pausa: `normal` va en null para que nadie lo aplique.
+    normal: promo ? null : { percent: porcentajeDescuentoOnline(), minimo: minimoDescuentoOnline() },
     promo: promo ? { nombre: 'Black Friday', etiqueta: promo.etiqueta, excluye: promo.excluye, fin: new Date(promo.fin).toISOString() } : null,
   };
 }
